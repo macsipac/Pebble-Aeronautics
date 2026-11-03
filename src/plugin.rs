@@ -3,6 +3,7 @@
 use std::cell::{Cell as StdCell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
+use std::time::Instant;
 
 use pumpkin_plugin_api::{
     BlockDisplayEntity, Context, DisplayTransformation, Entity, EntityDisplayExt, EntityType,
@@ -13,12 +14,13 @@ use pumpkin_plugin_api::{
     commands::{Command, CommandHandler},
     common::{BlockPos, GameMode, Hand},
     events::{EventHandler, EventPriority},
-    events_wit::{EntityInteractionAction, InteractAction, PlayerAnimationEventData, PlayerInteractEntityEventData, PlayerInteractEventData, PlayerInteractUnknownEntityEventData, PlayerToggleSneakEventData},
+    events_wit::{EntityExplodeEventData, EntityInteractionAction, InteractAction, PlayerAnimationEventData, PlayerInteractEntityEventData, PlayerInteractEventData, PlayerInteractUnknownEntityEventData, PlayerToggleSneakEventData},
     permission::{Permission, PermissionDefault, PermissionLevel},
     scheduler::SchedulerExt,
     text::TextComponent,
     world::{self, BlockFlags, World},
 };
+use pumpkin_plugin_api::events::entity::entity_explode::EntityExplodeEvent;
 use pumpkin_plugin_api::events::player::player_interact::PlayerInteractEvent;
 use pumpkin_plugin_api::events::player::player_interact_entity::PlayerInteractEntityEvent;
 use pumpkin_plugin_api::events::player::player_interact_unknown_entity::PlayerInteractUnknownEntityEvent;
@@ -62,15 +64,27 @@ const PUNCH_WINDOW_TICKS: u64 = 20;
 const TAG_NS: &str = "physics";
 const TAG_SESSION: &str = "session";
 /// How often (ticks) changed body poses are re-written into the display entities' saved data.
-const REFRESH_EVERY_TICKS: u64 = 20;
+const REFRESH_EVERY_TICKS: u64 = 60;
 /// How often (ticks) we scan for physics entities left over from a previous run / an unloaded chunk.
-const RECOVER_EVERY_TICKS: u64 = 40;
+const RECOVER_EVERY_TICKS: u64 = 60;
+/// The entity scan walks every entity of every world through the host, which is by far the most
+/// expensive thing this plugin does outside the physics tick, so it only runs when it can find something:
+/// - at most every `SCAN_MIN_GAP_TICKS` after a player's chunk changed (new chunks may have loaded),
+/// - every `RECOVER_EVERY_TICKS` while a previous scan left work open (waiting parts, a display strike),
+/// - every `SCAN_IDLE_TICKS` as a safety net (chunks loaded by something other than a player).
+const SCAN_MIN_GAP_TICKS: u64 = 120;
+const SCAN_IDLE_TICKS: u64 = 1200;
 /// A saved body whose parts are not all loaded yet waits this many scans for the rest before being
 /// revived with what is there.
-const MAX_WAIT_SCANS: u32 = 8;
+const MAX_WAIT_SCANS: u32 = 6;
+/// Visuals only move when a body moved more than this (blocks) since they were last placed.
+const POS_EPS: f64 = 1e-3;
+
 
 struct PartVis {
     id: u32,
+    /// Entity id of `display` (cached: asking the host costs a round trip).
+    did: u32,
     offset: [i32; 3],
     state: u16,
     display: Entity,
@@ -93,10 +107,12 @@ struct BodyVis {
     n_saved: StdCell<usize>,
     /// Pose last written into the entities' saved data.
     pose_saved: StdCell<Option<([f64; 3], [f32; 4])>>,
+    /// Position the display entities were last teleported for (NaN = never, so the first update applies).
+    last_pos: StdCell<[f64; 3]>,
 }
 impl BodyVis {
     fn new(parts: Vec<PartVis>, last_rot: [f32; 4]) -> Self {
-        Self { parts: RefCell::new(parts), last_rot: StdCell::new(last_rot), n_saved: StdCell::new(0), pose_saved: StdCell::new(None) }
+        Self { parts: RefCell::new(parts), last_rot: StdCell::new(last_rot), n_saved: StdCell::new(0), pose_saved: StdCell::new(None), last_pos: StdCell::new([f64::NAN; 3]) }
     }
     /// Makes the next save rewrite the part count and pose.
     fn invalidate(&self) {
@@ -110,6 +126,12 @@ struct State {
     /// Saved bodies waiting for their other parts to load: (world, session, body) -> scans waited.
     waiting: HashMap<(String, i64, i64), u32>,
     ticks: u64,
+    /// Tick of the last entity scan, whether the last scan left work open, and whether a player changed
+    /// chunk since (see `scan_due`).
+    last_scan: u64,
+    scan_again: bool,
+    chunks_dirty: bool,
+    player_chunks: Vec<(u32, i32, i32)>,
     last_action: HashMap<u32, u64>,
     /// Per-player punch tracking for breaking.
     punches: HashMap<u32, Punch>,
@@ -137,7 +159,7 @@ struct Punch {
 }
 thread_local! {
     static STATE: RefCell<State> = RefCell::new(State {
-        engines: HashMap::new(), bodies: HashMap::new(), waiting: HashMap::new(), ticks: 0, last_action: HashMap::new(),
+        engines: HashMap::new(), bodies: HashMap::new(), waiting: HashMap::new(), ticks: 0, last_scan: 0, scan_again: false, chunks_dirty: false, player_chunks: Vec::new(), last_action: HashMap::new(),
         punches: HashMap::new(), grabs: HashMap::new(), sneaking: HashSet::new(),
     });
 }
@@ -146,11 +168,36 @@ thread_local! {
 // world access
 // ---------------------------------------------------------------------------
 
-struct View<'a> { world: &'a World }
+/// World access for the engine. Every call into the host is expensive, so the answers are memoised for
+/// the lifetime of the `View` (one engine tick): terrain is queried in tight clusters, and many cells
+/// and chunks are asked for several times (several bodies, several substeps).
+struct View<'a> {
+    world: &'a World,
+    chunks: HashMap<(i32, i32), bool>,
+    states: HashMap<(i32, i32, i32), u16>,
+}
+impl<'a> View<'a> {
+    fn new(world: &'a World) -> Self {
+        Self { world, chunks: HashMap::new(), states: HashMap::new() }
+    }
+}
 impl WorldView for View<'_> {
     fn state_at(&mut self, c: Cell) -> Option<u16> {
-        self.world.get_chunk(c[0] >> 4, c[2] >> 4)?;
-        Some(self.world.get_block_state_id(BlockPos { x: c[0], y: c[1], z: c[2] }))
+        let key = (c[0], c[1], c[2]);
+        if let Some(s) = self.states.get(&key) { return Some(*s); }
+        let ck = (c[0] >> 4, c[2] >> 4);
+        let loaded = match self.chunks.get(&ck) {
+            Some(l) => *l,
+            None => {
+                let l = self.world.get_chunk(ck.0, ck.1).is_some();
+                self.chunks.insert(ck, l);
+                l
+            }
+        };
+        if !loaded { return None; }
+        let st = self.world.get_block_state_id(BlockPos { x: c[0], y: c[1], z: c[2] });
+        self.states.insert(key, st);
+        Some(st)
     }
     fn describe(&mut self, id: u16) -> StateInfo {
         let Some(s) = world::get_block_state_by_id(id) else { return StateInfo::empty() };
@@ -189,6 +236,11 @@ fn is_full_block(info: &StateInfo) -> bool {
     }
 }
 
+thread_local! {
+    /// Entity ids of every display and collider anchor this plugin owns. Entity queries return them too,
+    /// and telling "ours" from "somebody else's" by id costs one host call instead of several.
+    static OWN_IDS: RefCell<HashSet<u32>> = RefCell::new(HashSet::new());
+}
 thread_local! {
     /// Kept outside `STATE` so tagging entities never touches a `RefCell` that is already borrowed.
     static SESSION: StdCell<i64> = const { StdCell::new(0) };
@@ -268,19 +320,24 @@ fn is_sneaking(player: &pumpkin_plugin_api::Player) -> bool {
 }
 fn now_tick() -> u64 { STATE.with(|s| s.borrow().ticks) }
 
+/// The collider proximity pass runs every this many ticks (spawn/despawn of client-side shulkers does
+/// not need tick precision; the shulkers themselves are moved by the server's anchor teleports).
+const COLLIDER_SYNC_EVERY: u64 = 2;
+
 /// Keeps every nearby Java player's client in sync with the collision shulkers.
 fn sync_colliders(server: &Server) {
-    let grave: Vec<Rc<Collider>> = GRAVE.with(|g| std::mem::take(&mut *g.borrow_mut()));
-    let bodies: Vec<(String, Rc<BodyVis>)> = STATE.with(|s| s.borrow().bodies.iter().map(|((w, _), v)| (w.clone(), v.clone())).collect());
     let now = now_tick();
+    let sync_tick = now % COLLIDER_SYNC_EVERY == 0;
 
-    // Join tracking runs every tick, even with no bodies around, so that a player who joins first and
-    // gets a body spawned near them later still counts as "joined a while ago", not "just now".
+    // Join tracking runs every tick for players that are not cleared yet, so that a player who joins first
+    // and gets a body spawned near them later still counts as "joined a while ago", not "just now".
+    // Cleared players only matter on sync ticks, so their (host-call heavy) checks are skipped in between.
     let all_players = server.get_all_players();
     let mut players = Vec::new();
     for pl in &all_players {
         let e = pl.as_entity();
         let pid = e.get_id() as u32;
+        if !sync_tick && FIRST_SEEN.with(|f| f.borrow().get(&pid).is_some_and(|i| i.ready)) { continue; }
         let wname = pl.get_world().get_name();
         // A world change (respawn, dimension travel) makes the client reload everything, so it gets the
         // grace again. A client that is still loading cannot send movement, so the moment the player's
@@ -309,9 +366,14 @@ fn sync_colliders(server: &Server) {
         if !ready { continue; }
         players.push((pid, wname, e.get_eye_position(), jp));
     }
+    if !sync_tick { return; }
+
     // Forget players that left, so a reconnect (possibly with a reused id) gets the grace again.
     let online: HashSet<u32> = all_players.iter().map(|pl| pl.as_entity().get_id() as u32).collect();
     FIRST_SEEN.with(|f| f.borrow_mut().retain(|k, _| online.contains(k)));
+
+    let grave: Vec<Rc<Collider>> = GRAVE.with(|g| std::mem::take(&mut *g.borrow_mut()));
+    let bodies: Vec<(String, Rc<BodyVis>)> = STATE.with(|s| s.borrow().bodies.iter().map(|((w, _), v)| (w.clone(), v.clone())).collect());
     if grave.is_empty() && bodies.is_empty() { return; }
 
     for c in &grave {
@@ -321,7 +383,8 @@ fn sync_colliders(server: &Server) {
     }
     if players.is_empty() { return; }
 
-    let resend = now % 200 == 0; // clients forget entities on respawn; re-announce now and then
+    // Clients forget entities on respawn; re-announce now and then.
+    let resend = now % (COLLIDER_SYNC_EVERY * 100) == 0;
     let view2 = COLLIDER_VIEW * COLLIDER_VIEW;
     for (wname, vis) in &bodies {
         let Ok(parts) = vis.parts.try_borrow() else { continue };
@@ -338,8 +401,8 @@ fn sync_colliders(server: &Server) {
                         viewers.push((*pid, now));
                     }
                     // The server's own spawn of the anchor can reach the client after ours and replace the
-                    // shulker there; announce it again a few times.
-                    (true, Some(i)) if matches!(now.saturating_sub(viewers[i].1), 3 | 10 | 40) => {
+                    // shulker there; announce it again a few times (windows, as we only run every 2nd tick).
+                    (true, Some(i)) if matches!(now.saturating_sub(viewers[i].1), 3..=4 | 10..=11 | 40..=41) => {
                         for pk in spawn_packets(c, tgt) { jp.send_packet(&pk); }
                     }
                     (false, Some(i)) => {
@@ -350,7 +413,9 @@ fn sync_colliders(server: &Server) {
                 }
             }
             // Players that left the server / world: forget them.
-            viewers.retain(|v| players.iter().any(|p| p.0 == v.0 && &p.1 == wname));
+            if !viewers.is_empty() {
+                viewers.retain(|v| players.iter().any(|p| p.0 == v.0 && &p.1 == wname));
+            }
         }
     }
 }
@@ -408,6 +473,8 @@ fn spawn_part(world: &World, state: u16, offset: [i32; 3], id: u32, center: (f64
     apply_rotation(&bd, [0.0, 0.0, 0.0, 1.0]);
     display.set_has_gravity(false);
     tag(&display);
+    let did = display.get_id();
+    OWN_IDS.with(|o| { o.borrow_mut().insert(did); });
 
     // Collision (full-cube blocks only; a shulker is a full cube, slabs/stairs would feel wrong): see `Collider`.
     let feet = (center.0, center.1 - 0.5, center.2);
@@ -416,9 +483,10 @@ fn spawn_part(world: &World, state: u16, offset: [i32; 3], id: u32, center: (f64
         if let Some(abd) = a.as_block_display() { abd.get_display().set_teleport_duration(2); }
         a.set_has_gravity(false);
         tag(&a);
+        OWN_IDS.with(|o| { o.borrow_mut().insert(a.get_id()); });
         Rc::new(Collider { eid: a.get_id() as i32, anchor: a, target: StdCell::new(feet), viewers: RefCell::new(Vec::new()) })
     });
-    Ok(PartVis { id, offset, state, display, bd, col, nbt, inv: RefCell::new(Vec::new()), store: RefCell::new(None), strikes: StdCell::new(0) })
+    Ok(PartVis { id, did, offset, state, display, bd, col, nbt, inv: RefCell::new(Vec::new()), store: RefCell::new(None), strikes: StdCell::new(0) })
 }
 
 thread_local! {
@@ -429,6 +497,7 @@ thread_local! {
 const ANCHOR_LINGER_MS: i64 = 1500;
 
 fn flush_pending_anchors() {
+    if PENDING_ANCHORS.with(|p| p.borrow().is_empty()) { return; }
     let now = now_millis();
     let due: Vec<Rc<Collider>> = PENDING_ANCHORS.with(|p| {
         let mut p = p.borrow_mut();
@@ -440,11 +509,15 @@ fn flush_pending_anchors() {
         *p = keep;
         out
     });
-    for c in due { c.anchor.remove(); }
+    for c in due {
+        c.anchor.remove();
+        OWN_IDS.with(|o| { o.borrow_mut().remove(&(c.eid as u32)); });
+    }
 }
 
 fn kill_part(p: PartVis) {
     p.display.remove();
+    OWN_IDS.with(|o| { o.borrow_mut().remove(&p.did); });
     if let Some(c) = p.col {
         PENDING_ANCHORS.with(|a| a.borrow_mut().push((c.clone(), now_millis() + ANCHOR_LINGER_MS)));
         RECENT_DEAD.with(|r| { let mut r = r.borrow_mut(); r.push_back(c.eid); if r.len() > 256 { r.pop_front(); } });
@@ -490,37 +563,96 @@ fn push_out(e: &Entity, feet: (f64, f64, f64), hw: f64, h: f64, pos: [f64; 3], r
     }
 }
 
+/// Bodies further apart than this (blocks, on any axis) are not served by one shared entity query.
+const MAX_QUERY_SPAN: f64 = 96.0;
+
+struct PushBody {
+    lo: [f64; 3],
+    hi: [f64; 3],
+    pos: [f64; 3],
+    rot: [f32; 4],
+    vis: Rc<BodyVis>,
+    /// Block offsets, built the first time something has to be pushed out of this body.
+    offsets: Option<Vec<[i32; 3]>>,
+}
+
+/// Finds the living entities (and items) near the bodies of a world. Mobs and items are pushed out of the
+/// blocks here; everything living is reported to the engine so bodies can push / be stood on.
+///
+/// Every host call is a round trip, so this is built to make as few as possible: one entity query for a
+/// whole group of bodies (not one per body), our own displays and anchors skipped by id right away, and
+/// only the remaining entities asked for their type / position.
 fn collect_pushers(name: &str) -> Vec<PusherInput> {
-    // (bounds, an entity belonging to the body to query around)
-    let bodies: Vec<([f64; 3], [f64; 3], [f64; 3], [f32; 4], Rc<BodyVis>)> = STATE.with(|s| {
+    let mut bodies: Vec<PushBody> = STATE.with(|s| {
         let st = s.borrow();
         let Some(e) = st.engines.get(name) else { return Vec::new() };
         e.ids().into_iter().filter_map(|id| {
             let (lo, hi) = e.body_bounds(id)?;
             let (pos, rot, _) = e.body_state(id)?;
             let vis = st.bodies.get(&(name.to_string(), id))?.clone();
-            Some((lo, hi, pos, rot, vis))
+            Some(PushBody { lo, hi, pos, rot, vis, offsets: None })
         }).collect()
     });
-    let mut seen = HashSet::new();
+    if bodies.is_empty() { return Vec::new(); }
+
+    // One group for everything unless the bodies are spread far apart; then each body queries alone.
+    let mut span_lo = [f64::MAX; 3];
+    let mut span_hi = [f64::MIN; 3];
+    for b in &bodies {
+        for i in 0..3 { span_lo[i] = span_lo[i].min(b.lo[i]); span_hi[i] = span_hi[i].max(b.hi[i]); }
+    }
+    let together = (0..3).all(|i| span_hi[i] - span_lo[i] <= MAX_QUERY_SPAN);
+    let groups: Vec<Vec<usize>> = if together { vec![(0..bodies.len()).collect()] } else { (0..bodies.len()).map(|i| vec![i]).collect() };
+
+    let mut seen: HashSet<u32> = HashSet::new();
     let mut out = Vec::new();
-    for (lo, hi, pos, rot, vis) in bodies {
-        let Ok(parts) = vis.parts.try_borrow() else { continue };
-        let Some(first) = parts.first() else { continue };
-        let diag = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2)).sqrt() + 3.0;
-        let offsets: Vec<[i32; 3]> = parts.iter().map(|p| p.offset).collect();
-        for e in first.display.get_nearby_entities(diag, diag, diag) {
-            let living = e.is_living();
-            if !living && !matches!(e.get_type(), EntityType::Item) { continue; }
-            let p = e.get_position();
-            let near = p.0 > lo[0] - 2.0 && p.0 < hi[0] + 2.0 && p.1 > lo[1] - 2.5 && p.1 < hi[1] + 2.0 && p.2 > lo[2] - 2.0 && p.2 < hi[2] + 2.0;
-            if !near || !seen.insert(e.get_id()) { continue; }
-            // Mobs and items can't walk through the blocks: push them out (players have the client-side shulkers).
-            if !matches!(e.get_type(), EntityType::Player) {
-                push_out(&e, p, f64::from(e.get_width()) * 0.5, f64::from(e.get_height()), pos, rot, &offsets);
+    for group in groups {
+        // Box that covers the group (with the same margins the per-entity test below uses).
+        let mut lo = [f64::MAX; 3];
+        let mut hi = [f64::MIN; 3];
+        for &i in &group {
+            for k in 0..3 { lo[k] = lo[k].min(bodies[i].lo[k] - 2.5); hi[k] = hi[k].max(bodies[i].hi[k] + 2.5); }
+        }
+        // The query is centred on one of the group's displays.
+        let nearby: Vec<_> = 'q: {
+            for &i in &group {
+                let Ok(parts) = bodies[i].vis.parts.try_borrow() else { continue };
+                let Some(first) = parts.first() else { continue };
+                let c = first.display.get_position();
+                let half = |k: usize, c: f64| (c - lo[k]).abs().max((hi[k] - c).abs()) + 1.0;
+                break 'q first.display.get_nearby_entities(half(0, c.0), half(1, c.1), half(2, c.2)).into_iter().collect();
             }
-            if !living { continue; }
-            out.push(PusherInput { key: u64::from(e.get_id()), feet: [p.0, p.1, p.2], half_width: e.get_width() * 0.5, height: e.get_height() });
+            Vec::new()
+        };
+
+        for e in nearby {
+            let id = e.get_id();
+            if OWN_IDS.with(|o| o.borrow().contains(&id)) || !seen.insert(id) { continue; }
+            let living = e.is_living();
+            let ty = e.get_type();
+            if !living && !matches!(ty, EntityType::Item) { continue; }
+            let p = e.get_position();
+            let (w, h) = (e.get_width(), e.get_height());
+            let mut near_any = false;
+            for &i in &group {
+                let b = &mut bodies[i];
+                let near = p.0 > b.lo[0] - 2.0 && p.0 < b.hi[0] + 2.0 && p.1 > b.lo[1] - 2.5 && p.1 < b.hi[1] + 2.0 && p.2 > b.lo[2] - 2.0 && p.2 < b.hi[2] + 2.0;
+                if !near { continue; }
+                near_any = true;
+                // Mobs and items can't walk through the blocks: push them out (players have the client-side shulkers).
+                if !matches!(ty, EntityType::Player) {
+                    if b.offsets.is_none() {
+                        let Ok(parts) = b.vis.parts.try_borrow() else { continue };
+                        b.offsets = Some(parts.iter().map(|p| p.offset).collect());
+                    }
+                    if let Some(offs) = &b.offsets {
+                        push_out(&e, p, f64::from(w) * 0.5, f64::from(h), b.pos, b.rot, offs);
+                    }
+                }
+            }
+            if near_any && living {
+                out.push(PusherInput { key: u64::from(id), feet: [p.0, p.1, p.2], half_width: w * 0.5, height: h });
+            }
         }
     }
     out
@@ -967,8 +1099,10 @@ fn rebuild_body(world: &World, wname: &str, id: BodyId, vis: &Rc<BodyVis>) {
 
 /// One scan: revives bodies saved by a previous run and repairs bodies whose entities were lost to a
 /// chunk unload.
-fn recover(server: &Server) {
+fn recover(server: &Server) -> bool {
     let session = session();
+    // Set when the next scan should come soon: a display is on strike, or a saved body waits for parts.
+    let mut again = false;
 
     // Entity ids of every helper entity we currently own.
     let mut live: HashSet<u32> = HashSet::new();
@@ -991,6 +1125,9 @@ fn recover(server: &Server) {
     for world in server.get_all_worlds() {
         let wname = world.get_name();
         for e in world.get_entities() {
+            // Everything this plugin spawns is a block display. Checking the type first costs one host call
+            // for the (usually vast majority of) other entities instead of two.
+            if !matches!(e.get_type(), EntityType::BlockDisplay) { continue; }
             let id = e.get_id();
             loaded.insert(id);
             if live.contains(&id) { continue; }
@@ -1015,12 +1152,15 @@ fn recover(server: &Server) {
         let mut need = false;
         if let Ok(parts) = vis.parts.try_borrow() {
             for p in parts.iter() {
-                let c = part_center(pos, rot, p.offset);
-                let chunk_loaded = world.get_chunk((c.0.floor() as i32) >> 4, (c.2.floor() as i32) >> 4).is_some();
-                if chunk_loaded && !loaded.contains(&p.display.get_id()) {
+                // The chunk lookup creates a host resource, so it only happens for displays that look missing.
+                let missing = !loaded.contains(&p.did) && {
+                    let c = part_center(pos, rot, p.offset);
+                    world.get_chunk((c.0.floor() as i32) >> 4, (c.2.floor() as i32) >> 4).is_some()
+                };
+                if missing {
                     p.strikes.set(p.strikes.get().saturating_add(1));
                     // A copy of this body just reappeared, or the display has been missing for two scans.
-                    if copy_seen || p.strikes.get() >= 2 { need = true; }
+                    if copy_seen || p.strikes.get() >= 2 { need = true; } else { again = true; }
                 } else {
                     p.strikes.set(0);
                 }
@@ -1062,11 +1202,43 @@ fn recover(server: &Server) {
             for f in found { f.entity.remove(); }
         }
     }
+    again || STATE.with(|s| !s.borrow().waiting.is_empty())
+}
+
+/// Whether an entity scan can be worth its cost right now (see `SCAN_MIN_GAP_TICKS`).
+fn scan_due(now: u64) -> bool {
+    STATE.with(|s| {
+        let st = s.borrow();
+        let since = now.saturating_sub(st.last_scan);
+        st.last_scan == 0
+            || (st.scan_again && since >= RECOVER_EVERY_TICKS)
+            || (st.chunks_dirty && since >= SCAN_MIN_GAP_TICKS)
+            || since >= SCAN_IDLE_TICKS
+    })
+}
+
+/// Notes when a player moved to another chunk (or joined / left): that is when chunks, and the saved
+/// entities in them, may have loaded. Two host calls per player, no entity enumeration.
+fn watch_players(server: &Server) {
+    let mut now: Vec<(u32, i32, i32)> = server.get_all_players().iter().map(|p| {
+        let e = p.as_entity();
+        let pos = e.get_position();
+        (e.get_id(), (pos.0.floor() as i32) >> 4, (pos.2.floor() as i32) >> 4)
+    }).collect();
+    now.sort_unstable();
+    STATE.with(|s| {
+        let mut st = s.borrow_mut();
+        if st.player_chunks != now { st.chunks_dirty = true; st.player_chunks = now; }
+    });
 }
 
 fn housekeeping(server: &Server) {
     let now = now_tick();
-    if now % RECOVER_EVERY_TICKS == 1 { recover(server); }
+    if now % 20 == 3 { watch_players(server); }
+    if now % RECOVER_EVERY_TICKS == 1 && scan_due(now) {
+        let again = recover(server);
+        STATE.with(|s| { let mut st = s.borrow_mut(); st.last_scan = now; st.scan_again = again; st.chunks_dirty = false; });
+    }
     if now % REFRESH_EVERY_TICKS == 0 { refresh_tags(false); sync_storage(); }
     if now % RECOVER_EVERY_TICKS == 2 {
         // Forget crouch state of players that left.
@@ -1075,23 +1247,81 @@ fn housekeeping(server: &Server) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// profiler (`/physics profile`)
+// ---------------------------------------------------------------------------
+
+const PROF_HOUSE: usize = 0;
+const PROF_TNT: usize = 1;
+const PROF_GRAB: usize = 2;
+const PROF_PUSH: usize = 3;
+const PROF_ENGINE: usize = 4;
+const PROF_VISUAL: usize = 5;
+const PROF_COLLIDER: usize = 6;
+const PROF_TOTAL: usize = 7;
+const PROF_N: usize = 8;
+const PROF_NAMES: [&str; PROF_N] = ["housekeep", "blasts", "grabs", "pushers", "engine", "visuals", "colliders", "TOTAL"];
+
+#[derive(Default)]
+struct Prof { cur: [f64; PROF_N], total: [f64; PROF_N], max: [f64; PROF_N], ticks: u32 }
+thread_local! { static PROF: RefCell<Prof> = RefCell::new(Prof::default()); }
+
+/// Adds the time since `*t` to a section and restarts the stopwatch.
+fn lap(slot: usize, t: &mut Instant) {
+    let n = Instant::now();
+    let ms = n.duration_since(*t).as_secs_f64() * 1000.0;
+    PROF.with(|p| p.borrow_mut().cur[slot] += ms);
+    *t = n;
+}
+fn prof_end_tick(start: Instant) {
+    let ms = start.elapsed().as_secs_f64() * 1000.0;
+    PROF.with(|p| {
+        let mut p = p.borrow_mut();
+        p.cur[PROF_TOTAL] = ms;
+        for i in 0..PROF_N {
+            p.total[i] += p.cur[i];
+            if p.cur[i] > p.max[i] { p.max[i] = p.cur[i]; }
+            p.cur[i] = 0.0;
+        }
+        p.ticks += 1;
+    });
+}
+
 fn tick(server: Server) {
+    let start = Instant::now();
+    let mut t = start;
     STATE.with(|s| s.borrow_mut().ticks += 1);
     housekeeping(&server);
     flush_pending_anchors();
-    scan_tnt(&server);
+    lap(PROF_HOUSE, &mut t);
+    process_blasts(&server);
+    lap(PROF_TNT, &mut t);
     apply_grabs(&server);
+    lap(PROF_GRAB, &mut t);
     let names: Vec<String> = STATE.with(|s| s.borrow().engines.iter().filter(|(_, e)| !e.is_empty()).map(|(n, _)| n.clone()).collect());
     for name in names {
         let Some(world) = server.get_world_by_name(&name) else { continue };
         let pushers = collect_pushers(&name);
+        lap(PROF_PUSH, &mut t);
         let updates = STATE.with(|s| {
             let mut st = s.borrow_mut();
-            st.engines.get_mut(&name).map(|e| e.tick(&mut View { world: &world }, &pushers))
+            st.engines.get_mut(&name).map(|e| e.tick(&mut View::new(&world), &pushers))
         }).unwrap_or_default();
+        lap(PROF_ENGINE, &mut t);
 
-        for u in updates {
-            let vis = STATE.with(|s| s.borrow().bodies.get(&(name.clone(), u.id)).cloned());
+        // Resolve every update to its visuals under one borrow (and one key allocation per world).
+        let resolved: Vec<_> = STATE.with(|s| {
+            let st = s.borrow();
+            let mut key: Option<(String, BodyId)> = None;
+            updates.into_iter().map(|u| {
+                let k = key.get_or_insert_with(|| (name.clone(), u.id));
+                k.1 = u.id;
+                let vis = st.bodies.get(&*k).cloned();
+                (u, vis)
+            }).collect()
+        });
+
+        for (u, vis) in resolved {
             let Some(vis) = vis else { continue };
             if u.removed {
                 STATE.with(|s| { s.borrow_mut().bodies.remove(&(name.clone(), u.id)); });
@@ -1101,18 +1331,28 @@ fn tick(server: Server) {
                 }
                 continue;
             }
+            // Resting (or barely moving) bodies cost nothing: no teleports, no packets. The comparisons are
+            // against what was last *applied*, so slow drift still gets through once it adds up.
             let old = vis.last_rot.get();
             let dot = old[0] * u.rot[0] + old[1] * u.rot[1] + old[2] * u.rot[2] + old[3] * u.rot[3];
             let rot_changed = 1.0 - dot.abs() > 1e-7;
-            vis.last_rot.set(u.rot);
+            let lp = vis.last_pos.get();
+            // Written so that a NaN (never placed yet) counts as moved.
+            let still = (u.pos[0] - lp[0]).abs() <= POS_EPS && (u.pos[1] - lp[1]).abs() <= POS_EPS && (u.pos[2] - lp[2]).abs() <= POS_EPS;
+            if still && !rot_changed { continue; }
+            if rot_changed { vis.last_rot.set(u.rot); }
+            vis.last_pos.set(u.pos);
             if let Ok(parts) = vis.parts.try_borrow() {
                 for p in parts.iter() {
                     place_part_entities(p, u.pos, u.rot, rot_changed);
                 }
             }
         }
+        lap(PROF_VISUAL, &mut t);
     }
     sync_colliders(&server);
+    lap(PROF_COLLIDER, &mut t);
+    prof_end_tick(start);
 }
 
 // ---------------------------------------------------------------------------
@@ -1122,7 +1362,7 @@ fn tick(server: Server) {
 /// Spawns visuals + a body for a set of `(cell, state)` blocks. `anchor` is the cell of the offset-0 block.
 fn spawn_body_rotated(world: &World, blocks: &[(Cell, u16)], anchor: Cell, spawn_center: Option<[f64; 3]>, rot: Option<[f32; 4]>, nbts: &[Option<Vec<u8>>]) -> Result<BodyId, String> {
     let wname = world.get_name();
-    let mut view = View { world };
+    let mut view = View::new(world);
     let center = spawn_center.unwrap_or([f64::from(anchor[0]) + 0.5, f64::from(anchor[1]) + 0.5, f64::from(anchor[2]) + 0.5]);
 
     let mut specs = Vec::new();
@@ -1206,6 +1446,32 @@ impl CommandHandler for DeleteCmd {
         }
         sender.send_message(TextComponent::text(&format!("Removed {n} physics block(s)")));
         Ok(n)
+    }
+}
+
+struct ProfileCmd;
+impl CommandHandler for ProfileCmd {
+    fn handle(&self, sender: CommandSender, server: Server, _a: ConsumedArgs) -> Result<i32, CommandError> {
+        if !is_admin(&sender, &server) { return Err(CommandError::PermissionDenied); }
+        let (ticks, total, max) = PROF.with(|p| {
+            let mut p = p.borrow_mut();
+            let r = (p.ticks, p.total, p.max);
+            *p = Prof::default();
+            r
+        });
+        if ticks == 0 {
+            sender.send_message(TextComponent::text("No samples yet; run it again in a few seconds."));
+            return Ok(0);
+        }
+        let (bodies, parts) = STATE.with(|s| {
+            let st = s.borrow();
+            (st.bodies.len(), st.bodies.values().map(|b| b.parts.try_borrow().map_or(0, |p| p.len())).sum::<usize>())
+        });
+        sender.send_message(TextComponent::text(&format!("physics: {ticks} ticks, {bodies} bodies, {parts} parts (ms per tick)")));
+        for i in 0..PROF_N {
+            sender.send_message(TextComponent::text(&format!("{:<10} avg {:>7.3}   max {:>7.3}", PROF_NAMES[i], total[i] / f64::from(ticks), max[i])));
+        }
+        Ok(ticks as i32)
     }
 }
 
@@ -1650,8 +1916,7 @@ const BLAST_HARDNESS_FACTOR: f32 = 0.15;
 thread_local! {
     /// Primed TNT entities seen on the previous tick: entity id -> (world, last position).
     /// When one disappears, it has exploded.
-    static TNT_SEEN: RefCell<HashMap<u32, (String, (f64, f64, f64))>> = RefCell::new(HashMap::new());
-    static RNG: StdCell<u64> = const { StdCell::new(0x2545_F491_4F6C_DD1D) };
+        static RNG: StdCell<u64> = const { StdCell::new(0x2545_F491_4F6C_DD1D) };
 }
 
 fn rand01() -> f32 {
@@ -1730,32 +1995,41 @@ fn try_ignite(player: &pumpkin_plugin_api::Player, world: &World, wname: &str) -
     true
 }
 
-/// Detects primed TNT entities that vanished since the last tick (= exploded) and applies the blast.
-fn scan_tnt(server: &Server) {
-    let any = STATE.with(|s| s.borrow().engines.values().any(|e| !e.is_empty()));
-    if !any {
-        TNT_SEEN.with(|t| t.borrow_mut().clear());
-        return;
-    }
-    let mut now: HashMap<u32, (String, (f64, f64, f64))> = HashMap::new();
-    for world in server.get_all_worlds() {
-        let wname = world.get_name();
-        for e in world.get_entities() {
-            if matches!(e.get_type(), EntityType::Tnt) {
-                now.insert(e.get_id(), (wname.clone(), e.get_position()));
-            }
+thread_local! {
+    /// Explosions the server announced (position, power) that still have to be applied to the bodies.
+    static BLASTS: RefCell<Vec<((f64, f64, f64), f32)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The server announces every explosion (primed TNT, creepers, TNT minecarts, ...) just before it
+/// happens. We only note it down; the bodies are pushed in the next `tick`, outside the explosion code.
+/// No polling of the entity list is needed to find out about explosions.
+struct ExplodeHandler;
+impl EventHandler<EntityExplodeEvent> for ExplodeHandler {
+    fn handle(&self, _server: Server, ev: EntityExplodeEventData) -> EntityExplodeEventData {
+        // Touches only `BLASTS`: events can arrive while the plugin is in the middle of a host call, with
+        // `STATE` already borrowed, so it must not be read here.
+        if !ev.cancelled {
+            BLASTS.with(|b| {
+                let mut b = b.borrow_mut();
+                if b.len() < 64 { b.push((ev.position, ev.yield_rate)); }
+            });
         }
+        ev
     }
-    let gone: Vec<(String, (f64, f64, f64))> = TNT_SEEN.with(|t| {
-        let mut t = t.borrow_mut();
-        let g = t.iter().filter(|(id, _)| !now.contains_key(id)).map(|(_, v)| v.clone()).collect();
-        *t = now;
-        g
-    });
-    for (wname, at) in gone {
-        if let Some(world) = server.get_world_by_name(&wname) {
-            // Primed TNT explodes from the middle of its box.
-            explode_at(&world, &wname, (at.0, at.1 + 0.5, at.2));
+}
+
+/// Applies the explosions queued by [`ExplodeHandler`].
+fn process_blasts(server: &Server) {
+    let blasts = BLASTS.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    if blasts.is_empty() { return; }
+    let active: Vec<String> = STATE.with(|s| s.borrow().engines.iter().filter(|(_, e)| !e.is_empty()).map(|(n, _)| n.clone()).collect());
+    for (at, power) in blasts {
+        // The event does not say which world it happened in; `explode_at` only touches bodies that are
+        // actually within reach of the blast, so worlds without any are untouched.
+        for wname in &active {
+            if let Some(world) = server.get_world_by_name(wname) {
+                explode_at(&world, wname, at, f64::from(power).clamp(1.0, 12.0));
+            }
         }
     }
 }
@@ -1763,8 +2037,8 @@ fn scan_tnt(server: &Server) {
 /// Applies an explosion to every physics body in range: shoves it away (off-centre hits also spin it),
 /// then breaks parts with a chance that falls off with distance and rises with how soft the block is.
 /// Real blocks between the blast and a part shield it. Other TNT blocks are set off.
-fn explode_at(world: &World, wname: &str, at: (f64, f64, f64)) {
-    let reach = TNT_POWER * 2.0;
+fn explode_at(world: &World, wname: &str, at: (f64, f64, f64), power: f64) {
+    let reach = power * 2.0;
     let bodies: Vec<(BodyId, [f64; 3], [f32; 4], Rc<BodyVis>)> = STATE.with(|s| {
         let st = s.borrow();
         let Some(e) = st.engines.get(wname) else { return Vec::new() };
@@ -1809,7 +2083,7 @@ fn explode_at(world: &World, wname: &str, at: (f64, f64, f64)) {
             if *has_items { continue; } // chests with contents survive (the items would be lost)
             let hardness = world::get_block_state_by_id(*state).map_or(1.0, |s| s.hardness);
             if hardness < 0.0 || hardness >= 15.0 { continue; }
-            let falloff = (1.0 - d / (TNT_POWER * 1.15)).clamp(0.0, 1.0) as f32;
+            let falloff = (1.0 - d / (power * 1.15)).clamp(0.0, 1.0) as f32;
             let chance = falloff / (1.0 + hardness * BLAST_HARDNESS_FACTOR);
             if rand01() < chance { doomed.push((*bid, *pid, c, *state, false)); }
         }
@@ -1818,7 +2092,7 @@ fn explode_at(world: &World, wname: &str, at: (f64, f64, f64)) {
         if let Some((d, off, c, blocked)) = nearest {
             let mut impact = (1.0 - d / reach).clamp(0.0, 1.0) as f32;
             if blocked { impact *= 0.25; }
-            let speed = BLAST_SPEED * impact / (1.0 + BLAST_MASS_FACTOR * n);
+            let speed = BLAST_SPEED * (power / TNT_POWER) as f32 * impact / (1.0 + BLAST_MASS_FACTOR * n);
             if speed > 0.2 {
                 let mut v = [(c.0 - at.0) as f32, (c.1 - at.1) as f32 + 0.4, (c.2 - at.2) as f32];
                 let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-4);
@@ -1881,7 +2155,7 @@ fn place_part(world: &World, wname: &str, _clicked_body: BodyId, player: &pumpki
     let off = [base[0] + hit.normal_local[0], base[1] + hit.normal_local[1], base[2] + hit.normal_local[2]];
     if total_parts() + 1 > MAX_PARTS { return; }
 
-    let mut view = View { world };
+    let mut view = View::new(world);
     let part = STATE.with(|s| {
         let mut st = s.borrow_mut();
         let eng = st.engines.get_mut(wname)?;
@@ -1950,13 +2224,15 @@ impl Plugin for Physics {
         use pumpkin_plugin_api::command::CommandNode;
         let cmd = Command::new(&["physics".to_string()], "Blocks with real physics")
             .then(CommandNode::literal("delete").execute(DeleteCmd))
-            .then(CommandNode::literal("assemble").execute(AssembleCmd));
+            .then(CommandNode::literal("assemble").execute(AssembleCmd))
+            .then(CommandNode::literal("profile").execute(ProfileCmd));
         ctx.register_command(cmd, PERM_USE);
         ctx.register_event_handler::<PlayerToggleSneakEvent, _>(SneakHandler, EventPriority::Normal, false)?;
         ctx.register_event_handler::<PlayerAnimationEvent, _>(AnimHandler, EventPriority::Normal, true)?;
         ctx.register_event_handler::<PlayerInteractEntityEvent, _>(EntityHandler, EventPriority::Normal, true)?;
         ctx.register_event_handler::<PlayerInteractUnknownEntityEvent, _>(UnknownEntityHandler, EventPriority::Normal, true)?;
         ctx.register_event_handler::<PlayerInteractEvent, _>(UseHandler, EventPriority::Normal, true)?;
+        ctx.register_event_handler::<EntityExplodeEvent, _>(ExplodeHandler, EventPriority::Lowest, true)?;
         ctx.schedule_repeating_task(1, 1, tick);
         Ok(())
     }
