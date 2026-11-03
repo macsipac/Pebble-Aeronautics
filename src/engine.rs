@@ -919,10 +919,20 @@ impl Engine {
         let dt = self.cfg.tick_dt;
         let mut changed: Vec<Cell> = Vec::new();
 
+        // Sleeping bodies only look at their surroundings once per refresh interval (spread over the ticks
+        // by body id), so a sleeping body costs neither the AABB nor the per-cell lookups on other ticks.
+        // Cells are only ever re-read once they are `interval` ticks stale anyway, and the 200-tick
+        // eviction below is far longer than the interval, so nothing is dropped early.
+        let sleep_every = self.cfg.sleep_refresh_ticks.max(1);
         let handles: Vec<(RigidBodyHandle, Option<(Vector, Vector)>)> = self
             .bodies
-            .values()
-            .map(|b| (b.handle, self.body_aabb(b)))
+            .iter()
+            .filter_map(|(id, b)| {
+                if self.world.bodies[b.handle].is_sleeping() && t.wrapping_add(*id) % sleep_every != 0 {
+                    return None;
+                }
+                Some((b.handle, self.body_aabb(b)))
+            })
             .collect();
 
         for (h, aabb) in handles {
