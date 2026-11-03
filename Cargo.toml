@@ -1,0 +1,21 @@
+[package]
+name = "pumpkin-physics"
+version = "0.1.0"
+edition = "2024"
+description = "Rigid-body physics for block displays on a Pumpkin server (/physics)."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+# cdylib -> the .wasm plugin, rlib -> lets `cargo test` run the physics natively.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rapier3d = "0.36"
+pumpkin-plugin-api = { path = "../pumpkin/crates/pumpkin-plugin-api" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
