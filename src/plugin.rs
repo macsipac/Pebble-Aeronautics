@@ -224,12 +224,23 @@ thread_local! {
     /// Ids of recently removed colliders: a client may still click the shulker for a moment.
     static RECENT_DEAD: RefCell<VecDeque<i32>> = const { RefCell::new(VecDeque::new()) };
     /// Tick at which each player was first seen by `sync_colliders` (player entity id -> tick).
-    static FIRST_SEEN: RefCell<HashMap<u32, u64>> = RefCell::new(HashMap::new());
+    static FIRST_SEEN: RefCell<HashMap<u32, JoinInfo>> = RefCell::new(HashMap::new());
 }
 /// Ticks a player must have been online before they get raw collider packets. A player that shows
 /// up in the player list can still be finishing the join sequence (login / configuration / world
 /// load); a spawn packet arriving then is a protocol violation and the client disconnects.
-const JOIN_GRACE_TICKS: u64 = 60;
+const JOIN_GRACE_TICKS: u64 = 200;
+/// What `sync_colliders` knows about a player's join: when it first saw them in this world, where they
+/// stood and looked on the previous tick (kept in memory only, refreshed every tick while the player is
+/// not ready yet; any change from it means the client is in the world), and whether they are cleared
+/// for packets.
+struct JoinInfo {
+    first: u64,
+    world: String,
+    pos: (f64, f64, f64),
+    look: (f32, f32),
+    ready: bool,
+}
 fn spawn_packets(c: &Collider, at: (f64, f64, f64)) -> [ClientboundPacket; 2] {
     let n = c.eid as u64;
     [
@@ -261,21 +272,47 @@ fn now_tick() -> u64 { STATE.with(|s| s.borrow().ticks) }
 fn sync_colliders(server: &Server) {
     let grave: Vec<Rc<Collider>> = GRAVE.with(|g| std::mem::take(&mut *g.borrow_mut()));
     let bodies: Vec<(String, Rc<BodyVis>)> = STATE.with(|s| s.borrow().bodies.iter().map(|((w, _), v)| (w.clone(), v.clone())).collect());
-    if grave.is_empty() && bodies.is_empty() { return; }
     let now = now_tick();
 
+    // Join tracking runs every tick, even with no bodies around, so that a player who joins first and
+    // gets a body spawned near them later still counts as "joined a while ago", not "just now".
+    let all_players = server.get_all_players();
     let mut players = Vec::new();
-    for pl in server.get_all_players() {
-        let Some(jp) = pl.as_java() else { continue };
+    for pl in &all_players {
         let e = pl.as_entity();
         let pid = e.get_id() as u32;
-        let first = FIRST_SEEN.with(|f| *f.borrow_mut().entry(pid).or_insert(now));
-        if now.saturating_sub(first) < JOIN_GRACE_TICKS { continue; }
-        players.push((pid, pl.get_world().get_name(), e.get_eye_position(), jp));
+        let wname = pl.get_world().get_name();
+        // A world change (respawn, dimension travel) makes the client reload everything, so it gets the
+        // grace again. A client that is still loading cannot send movement, so the moment the player's
+        // position or view changes from one tick to the next, it is certainly in the world and the
+        // grace ends early.
+        let pos = e.get_position();
+        let look = (e.get_yaw() as f32, e.get_pitch() as f32);
+        let ready = FIRST_SEEN.with(|f| {
+            let mut f = f.borrow_mut();
+            let ent = f.entry(pid).or_insert_with(|| JoinInfo { first: now, world: wname.clone(), pos, look, ready: false });
+            if ent.world != wname {
+                *ent = JoinInfo { first: now, world: wname.clone(), pos, look, ready: false };
+            }
+            if !ent.ready {
+                // Compare with where the player was last tick, then remember the current state.
+                let changed = dist_sq(pos, ent.pos) > 1e-4
+                    || (look.0 - ent.look.0).abs() > 0.01
+                    || (look.1 - ent.look.1).abs() > 0.01;
+                ent.pos = pos;
+                ent.look = look;
+                if changed || now.saturating_sub(ent.first) >= JOIN_GRACE_TICKS { ent.ready = true; }
+            }
+            ent.ready
+        });
+        let Some(jp) = pl.as_java() else { continue };
+        if !ready { continue; }
+        players.push((pid, wname, e.get_eye_position(), jp));
     }
     // Forget players that left, so a reconnect (possibly with a reused id) gets the grace again.
-    let online: HashSet<u32> = server.get_all_players().iter().map(|pl| pl.as_entity().get_id() as u32).collect();
+    let online: HashSet<u32> = all_players.iter().map(|pl| pl.as_entity().get_id() as u32).collect();
     FIRST_SEEN.with(|f| f.borrow_mut().retain(|k, _| online.contains(k)));
+    if grave.is_empty() && bodies.is_empty() { return; }
 
     for c in &grave {
         for (pid, _) in c.viewers.borrow().iter() {
@@ -384,10 +421,32 @@ fn spawn_part(world: &World, state: u16, offset: [i32; 3], id: u32, center: (f64
     Ok(PartVis { id, offset, state, display, bd, col, nbt, inv: RefCell::new(Vec::new()), store: RefCell::new(None), strikes: StdCell::new(0) })
 }
 
+thread_local! {
+    /// Anchors of removed colliders, kept alive briefly: a click packet for the client-side shulker can
+    /// still be in flight, and Pumpkin panics ("entity not found") if the entity is already gone.
+    static PENDING_ANCHORS: RefCell<Vec<(Rc<Collider>, i64)>> = const { RefCell::new(Vec::new()) };
+}
+const ANCHOR_LINGER_MS: i64 = 1500;
+
+fn flush_pending_anchors() {
+    let now = now_millis();
+    let due: Vec<Rc<Collider>> = PENDING_ANCHORS.with(|p| {
+        let mut p = p.borrow_mut();
+        let mut keep = Vec::new();
+        let mut out = Vec::new();
+        for (c, t) in p.drain(..) {
+            if t <= now { out.push(c); } else { keep.push((c, t)); }
+        }
+        *p = keep;
+        out
+    });
+    for c in due { c.anchor.remove(); }
+}
+
 fn kill_part(p: PartVis) {
     p.display.remove();
     if let Some(c) = p.col {
-        c.anchor.remove();
+        PENDING_ANCHORS.with(|a| a.borrow_mut().push((c.clone(), now_millis() + ANCHOR_LINGER_MS)));
         RECENT_DEAD.with(|r| { let mut r = r.borrow_mut(); r.push_back(c.eid); if r.len() > 256 { r.pop_front(); } });
         GRAVE.with(|g| g.borrow_mut().push(c));
     }
@@ -913,6 +972,7 @@ fn recover(server: &Server) {
 
     // Entity ids of every helper entity we currently own.
     let mut live: HashSet<u32> = HashSet::new();
+    PENDING_ANCHORS.with(|p| { for (c, _) in p.borrow().iter() { live.insert(c.anchor.get_id()); } });
     STATE.with(|s| {
         for vis in s.borrow().bodies.values() {
             if let Ok(parts) = vis.parts.try_borrow() {
@@ -1018,6 +1078,8 @@ fn housekeeping(server: &Server) {
 fn tick(server: Server) {
     STATE.with(|s| s.borrow_mut().ticks += 1);
     housekeeping(&server);
+    flush_pending_anchors();
+    scan_tnt(&server);
     apply_grabs(&server);
     let names: Vec<String> = STATE.with(|s| s.borrow().engines.iter().filter(|(_, e)| !e.is_empty()).map(|(n, _)| n.clone()).collect());
     for name in names {
@@ -1234,6 +1296,9 @@ impl EventHandler<PlayerInteractEntityEvent> for EntityHandler {
             if !matches!(ev.action, EntityInteractionAction::Attack) {
                 use_block(&ev.player);
             }
+        } else if RECENT_DEAD.with(|r| r.borrow().contains(&ev.entity_id)) {
+            // Late click on a shulker whose block just went away: swallow it, don't act on what's behind.
+            ev.cancelled = true;
         }
         ev
     }
@@ -1362,6 +1427,9 @@ fn use_block(player: &pumpkin_plugin_api::Player) -> bool {
     let wname = world.get_name();
     let pid = player.as_entity().get_id();
     let now = now_tick();
+
+    // Flint and steel on a TNT block lights it (before anything else, so it works while crouching too).
+    if try_ignite(player, &world, &wname) { return true; }
 
     let sneaking = is_sneaking(player);
     if !sneaking && try_interact(player, &wname, now) { return true; }
@@ -1563,6 +1631,228 @@ fn break_part(wname: &str, body: BodyId, part: u32, player: &pumpkin_plugin_api:
             }
         }
         Removed::NotFound => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TNT: ignite with flint and steel, and explosions that hit physics bodies
+// ---------------------------------------------------------------------------
+
+/// Explosion power of a primed TNT entity (vanilla: 4).
+const TNT_POWER: f64 = 4.0;
+/// Peak speed (blocks/second) a one-block body gets from a point-blank blast.
+const BLAST_SPEED: f32 = 20.0;
+/// Extra bodies weigh more: speed is divided by `1 + BLAST_MASS_FACTOR * parts`.
+const BLAST_MASS_FACTOR: f32 = 0.05;
+/// Chance falloff multiplier for the hardness of a block (obsidian etc. never break).
+const BLAST_HARDNESS_FACTOR: f32 = 0.15;
+
+thread_local! {
+    /// Primed TNT entities seen on the previous tick: entity id -> (world, last position).
+    /// When one disappears, it has exploded.
+    static TNT_SEEN: RefCell<HashMap<u32, (String, (f64, f64, f64))>> = RefCell::new(HashMap::new());
+    static RNG: StdCell<u64> = const { StdCell::new(0x2545_F491_4F6C_DD1D) };
+}
+
+fn rand01() -> f32 {
+    RNG.with(|r| {
+        let mut x = r.get() ^ (now_millis() as u64);
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        r.set(x | 1);
+        ((x >> 40) as f32) / 16_777_216.0
+    })
+}
+
+/// Removes one part (visual + physics) and registers any bodies the removal split off.
+/// Returns the split-off `(new body, part ids)` groups, or `None` when the part wasn't there.
+/// Part ids stay the same when a part moves to a split-off body.
+fn remove_and_split(wname: &str, body: BodyId, part: u32, vis: &Rc<BodyVis>) -> Option<Vec<(BodyId, Vec<u32>)>> {
+    let result = STATE.with(|s| s.borrow_mut().engines.get_mut(wname).map(|e| e.remove_part(body, part)))?;
+    if matches!(result, Removed::NotFound) { return None; }
+    let removed = {
+        let mut parts = vis.parts.borrow_mut();
+        parts.iter().position(|p| p.id == part).map(|i| parts.remove(i))
+    };
+    if let Some(p) = removed { kill_part(p); }
+    vis.invalidate();
+    let mut out = Vec::new();
+    match result {
+        Removed::BodyGone => {
+            STATE.with(|s| { s.borrow_mut().bodies.remove(&(wname.to_string(), body)); });
+        }
+        Removed::Ok(splits) => {
+            for sp in splits {
+                out.push((sp.body, sp.parts.iter().copied().collect::<Vec<u32>>()));
+                let moved: Vec<PartVis> = {
+                    let mut parts = vis.parts.borrow_mut();
+                    let mut m = Vec::new();
+                    let mut i = 0;
+                    while i < parts.len() {
+                        if sp.parts.contains(&parts[i].id) { m.push(parts.remove(i)); } else { i += 1; }
+                    }
+                    m
+                };
+                STATE.with(|s| {
+                    let mut st = s.borrow_mut();
+                    for p in &moved { write_static(p, sp.body); }
+                    st.bodies.insert((wname.to_string(), sp.body), Rc::new(BodyVis::new(moved, vis.last_rot.get())));
+                });
+            }
+        }
+        Removed::NotFound => {}
+    }
+    Some(out)
+}
+
+/// Spawns a primed TNT entity where a physics TNT block was.
+fn spawn_primed_tnt(world: &World, center: (f64, f64, f64)) {
+    world.spawn_entity(EntityType::Tnt, (center.0, center.1 - 0.5, center.2));
+}
+
+/// Right-click with flint and steel on a TNT physics block: the block disappears and a TNT entity takes its place.
+fn try_ignite(player: &pumpkin_plugin_api::Player, world: &World, wname: &str) -> bool {
+    let Some(stack) = player.get_item_in_hand(Hand::Right) else { return false };
+    if norm(&stack.get_registry_key()) != "flint_and_steel" { return false; }
+    let e = player.as_entity();
+    let (eye, dir) = (e.get_eye_position(), look_dir(&e));
+    let Some(hit) = STATE.with(|s| s.borrow().engines.get(wname).and_then(|eng| eng.raycast([eye.0, eye.1, eye.2], dir, REACH))) else { return false };
+    let Some(vis) = STATE.with(|s| s.borrow().bodies.get(&(wname.to_string(), hit.body)).cloned()) else { return false };
+    let info = vis.parts.borrow().iter().find(|p| p.id == hit.part).map(|p| (p.offset, p.state));
+    let Some((off, state)) = info else { return false };
+    if !world::block_state_to_info(state).is_some_and(|i| norm(&i.name) == "tnt") { return false; }
+    let Some((pos, rot, _)) = STATE.with(|s| s.borrow().engines.get(wname).and_then(|eng| eng.body_state(hit.body))) else { return true };
+    let center = part_center(pos, rot, off);
+    if remove_and_split(wname, hit.body, hit.part, &vis).is_none() { return true; }
+    spawn_primed_tnt(world, center);
+    world.play_custom_sound("minecraft:item.flintandsteel.use", SoundCategory::Blocks, center, 1.0, 1.0);
+    true
+}
+
+/// Detects primed TNT entities that vanished since the last tick (= exploded) and applies the blast.
+fn scan_tnt(server: &Server) {
+    let any = STATE.with(|s| s.borrow().engines.values().any(|e| !e.is_empty()));
+    if !any {
+        TNT_SEEN.with(|t| t.borrow_mut().clear());
+        return;
+    }
+    let mut now: HashMap<u32, (String, (f64, f64, f64))> = HashMap::new();
+    for world in server.get_all_worlds() {
+        let wname = world.get_name();
+        for e in world.get_entities() {
+            if matches!(e.get_type(), EntityType::Tnt) {
+                now.insert(e.get_id(), (wname.clone(), e.get_position()));
+            }
+        }
+    }
+    let gone: Vec<(String, (f64, f64, f64))> = TNT_SEEN.with(|t| {
+        let mut t = t.borrow_mut();
+        let g = t.iter().filter(|(id, _)| !now.contains_key(id)).map(|(_, v)| v.clone()).collect();
+        *t = now;
+        g
+    });
+    for (wname, at) in gone {
+        if let Some(world) = server.get_world_by_name(&wname) {
+            // Primed TNT explodes from the middle of its box.
+            explode_at(&world, &wname, (at.0, at.1 + 0.5, at.2));
+        }
+    }
+}
+
+/// Applies an explosion to every physics body in range: shoves it away (off-centre hits also spin it),
+/// then breaks parts with a chance that falls off with distance and rises with how soft the block is.
+/// Real blocks between the blast and a part shield it. Other TNT blocks are set off.
+fn explode_at(world: &World, wname: &str, at: (f64, f64, f64)) {
+    let reach = TNT_POWER * 2.0;
+    let bodies: Vec<(BodyId, [f64; 3], [f32; 4], Rc<BodyVis>)> = STATE.with(|s| {
+        let st = s.borrow();
+        let Some(e) = st.engines.get(wname) else { return Vec::new() };
+        e.ids().into_iter().filter_map(|id| {
+            let (lo, hi) = e.body_bounds(id)?;
+            let (pos, rot, _) = e.body_state(id)?;
+            let inside = at.0 > lo[0] - reach && at.0 < hi[0] + reach
+                && at.1 > lo[1] - reach && at.1 < hi[1] + reach
+                && at.2 > lo[2] - reach && at.2 < hi[2] + reach;
+            if !inside { return None; }
+            Some((id, pos, rot, st.bodies.get(&(wname.to_string(), id))?.clone()))
+        }).collect()
+    });
+
+    // Where each part currently lives; changes when a removal splits the body.
+    let mut loc: HashMap<(BodyId, u32), (BodyId, Rc<BodyVis>)> = HashMap::new();
+    // (body at blast time, part id, centre, state, ignite?)
+    let mut doomed: Vec<(BodyId, u32, (f64, f64, f64), u16, bool)> = Vec::new();
+
+    for (bid, pos, rot, vis) in &bodies {
+        let infos: Vec<(u32, [i32; 3], u16, bool)> = {
+            let Ok(ps) = vis.parts.try_borrow() else { continue };
+            ps.iter().map(|p| { snapshot(p); (p.id, p.offset, p.state, !p.inv.borrow().is_empty()) }).collect()
+        };
+        let n = infos.len() as f32;
+        let mut nearest: Option<(f64, [i32; 3], (f64, f64, f64), bool)> = None;
+
+        for (pid, off, state, has_items) in &infos {
+            loc.insert((*bid, *pid), (*bid, vis.clone()));
+            let c = part_center(*pos, *rot, *off);
+            let d = dist_sq(c, at).sqrt();
+            if d > reach { continue; }
+            let shielded_by_world = world.ray_trace_blocks(at, c).is_some_and(|b| dist_sq(b, at).sqrt() + 0.05 < d);
+            if nearest.as_ref().is_none_or(|b| d < b.0) { nearest = Some((d, *off, c, shielded_by_world)); }
+            if shielded_by_world { continue; }
+
+            let is_tnt = world::block_state_to_info(*state).is_some_and(|i| norm(&i.name) == "tnt");
+            if is_tnt && d < reach * 0.75 {
+                doomed.push((*bid, *pid, c, *state, true));
+                continue;
+            }
+            if *has_items { continue; } // chests with contents survive (the items would be lost)
+            let hardness = world::get_block_state_by_id(*state).map_or(1.0, |s| s.hardness);
+            if hardness < 0.0 || hardness >= 15.0 { continue; }
+            let falloff = (1.0 - d / (TNT_POWER * 1.15)).clamp(0.0, 1.0) as f32;
+            let chance = falloff / (1.0 + hardness * BLAST_HARDNESS_FACTOR);
+            if rand01() < chance { doomed.push((*bid, *pid, c, *state, false)); }
+        }
+
+        // Push the body away from the blast, from the part closest to it.
+        if let Some((d, off, c, blocked)) = nearest {
+            let mut impact = (1.0 - d / reach).clamp(0.0, 1.0) as f32;
+            if blocked { impact *= 0.25; }
+            let speed = BLAST_SPEED * impact / (1.0 + BLAST_MASS_FACTOR * n);
+            if speed > 0.2 {
+                let mut v = [(c.0 - at.0) as f32, (c.1 - at.1) as f32 + 0.4, (c.2 - at.2) as f32];
+                let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-4);
+                v = [v[0] / len, v[1] / len, v[2] / len];
+                let target = [c.0 + f64::from(v[0] * speed), c.1 + f64::from(v[1] * speed), c.2 + f64::from(v[2] * speed)];
+                let local = [off[0] as f32, off[1] as f32, off[2] as f32];
+                // One full-strength blend sets the body's velocity at that point; it then flies on its own.
+                STATE.with(|s| {
+                    if let Some(eng) = s.borrow_mut().engines.get_mut(wname) {
+                        eng.drag(*bid, local, target, GRAB_GAIN, speed, 1.0);
+                    }
+                });
+            }
+        }
+    }
+
+    // Break parts. The body may split along the way, so follow each part to wherever it ended up.
+    for (bid, pid, c, state, ignite) in doomed {
+        let Some((cur_body, cur_vis)) = loc.get(&(bid, pid)).cloned() else { continue };
+        let Some(splits) = remove_and_split(wname, cur_body, pid, &cur_vis) else { continue };
+        for (new_body, ids) in splits {
+            let Some(nv) = STATE.with(|s| s.borrow().bodies.get(&(wname.to_string(), new_body)).cloned()) else { continue };
+            for id in ids {
+                // Parts that moved to the new body (keys are original body + part id).
+                for ((ob, opid), v) in loc.iter_mut() {
+                    if *ob == bid && *opid == id { *v = (new_body, nv.clone()); }
+                }
+            }
+        }
+        if ignite {
+            spawn_primed_tnt(world, c);
+        } else if let Some(info) = world::block_state_to_info(state) {
+            world.play_custom_sound(block_sounds(&info.name).1, SoundCategory::Blocks, c, 1.0, 0.8);
+        }
     }
 }
 
