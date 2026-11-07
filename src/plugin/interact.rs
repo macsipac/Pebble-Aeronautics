@@ -295,10 +295,11 @@ impl EventHandler<PlayerInteractEvent> for UseHandler {
     fn handle(&self, _server: Server, mut ev: PlayerInteractEventData) -> PlayerInteractEventData {
         refresh_grab(&ev.player);
         let right = matches!(ev.action, InteractAction::RightClickAir | InteractAction::RightClickBlock);
-        // A minecart item that carries blocks, onto a rail: the cart comes back with its blocks.
-        if matches!(ev.action, InteractAction::RightClickBlock) && ev.block.ends_with("rail") {
+        // A cart item (minecart / cart egg) used on a block: put the cart there ourselves, right now, instead of letting
+        // Pumpkin spawn the placeholder zombie of the egg. (Spawning here is safe: there is no EntitySpawnEvent handler.)
+        if matches!(ev.action, InteractAction::RightClickBlock) {
             if let Some(pos) = ev.clicked_pos {
-                if try_place_cart(&ev.player, pos) { ev.cancelled = true; return ev; }
+                if try_place_cart(&ev.player, pos, ev.block.ends_with("rail")) { ev.cancelled = true; return ev; }
             }
         }
         // A block that rides on a cart: place onto it (right-click) or swallow the click (left-click punches).
@@ -1107,7 +1108,7 @@ fn egg_entity_data(blocks: &[u8]) -> Vec<u8> {
     v.push(10); // unnamed root compound
     // The zombie only exists for a moment before it becomes the cart: no AI, gravity, noise or damage, not a
     // baby.
-    for flag in ["Invulnerable", "NoAI", "NoGravity", "Silent"] {
+    for flag in ["Invulnerable", "NoAI", "NoGravity", "Silent", "Invisible"] {
         nbt_name(&mut v, 1, flag);
         v.push(1);
     }
@@ -1374,39 +1375,6 @@ impl EventHandler<VehicleDestroyEvent> for CartDestroyHandler {
     }
 }
 
-/// Allays that just spawned (world, entity id, tries so far): one of them may be a cart egg's.
-thread_local! {
-    static EGG_SPAWNS: RefCell<Vec<(String, u32, u8)>> = const { RefCell::new(Vec::new()) };
-}
-
-/// Pumpkin reports the spawned entity's type as its numeric registry id ("133"), not its name, so compare
-/// against the id read off the egg (falling back to the known one) as well as the name.
-fn is_cube_type(t: &str) -> bool {
-    thread_local! {
-        static CUBE_ID: String = {
-            let v = ItemStack::of(CART_EGG, 1).get_components().into_iter()
-                .find(|c| is_comp(c.component, "entity-data")).map(|c| varint_prefix(&c.value)).unwrap_or_default();
-            let (mut n, mut shift) = (0u32, 0);
-            for b in &v { n |= u32::from(b & 0x7f) << shift; shift += 7; }
-            if v.is_empty() { u32::from(ALLAY_TYPE_ID_FALLBACK).to_string() } else { n.to_string() }
-        };
-    }
-    t == "zombie" || t == "minecraft:zombie" || CUBE_ID.with(|id| t == id)
-}
-
-/// Notes every allay that spawns; `convert_egg_carts` looks at them a tick later. (Placing the egg, a
-/// dispenser firing it and `/give` + right-click are all just Pumpkin spawning an allay with custom data.)
-pub(super) struct EggCartHandler;
-impl EventHandler<EntitySpawnEvent> for EggCartHandler {
-    fn handle(&self, _server: Server, ev: EntitySpawnEventData) -> EntitySpawnEventData {
-        if !ev.cancelled && is_cube_type(&ev.entity_type) {
-            let w = ev.target_world.get_name();
-            EGG_SPAWNS.with(|e| { if let Ok(mut v) = e.try_borrow_mut() { v.push((w, ev.entity_id as u32, 0)); } });
-        }
-        ev
-    }
-}
-
 /// Where the cart goes: on the rail at or just under the spawned allay, else where the allay stood.
 fn egg_cart_spot(world: &World, p: (f64, f64, f64)) -> (f64, f64, f64) {
     let (x, z) = (p.0.floor() as i32, p.2.floor() as i32);
@@ -1437,20 +1405,23 @@ fn convert_egg_cart(world: &World, e: &Entity) -> bool {
 /// Called by the recovery scan for every allay (catches one the spawn event missed).
 pub(super) fn egg_cart_adopt(world: &World, e: &Entity) { convert_egg_cart(world, e); }
 
+/// How often (ticks) the entities are checked for a cart egg that something other than a player click spawned
+/// (dispenser, `/summon`, `/give` + other mods). Players placing the egg never wait for this.
+const EGG_SCAN_EVERY_TICKS: u64 = 4;
+
+/// Finds cart eggs spawned without a click (dispensers). There is deliberately no EntitySpawnEvent handler (it
+/// deadlocks the server, see `Physics::on_load`), so this walks the entities every few ticks while players are
+/// online. The placeholder zombie is invisible and has no AI, so the short wait is not noticeable.
 fn convert_egg_carts(server: &Server) {
-    let pending = EGG_SPAWNS.with(|e| std::mem::take(&mut *e.borrow_mut()));
-    if pending.is_empty() { return; }
-    let mut waiting = Vec::new();
-    for (wname, id, tries) in pending {
-        let Some(world) = server.get_world_by_name(&wname) else { continue };
-        match world.get_entities().into_iter().find(|e| e.get_id() == id) {
-            // The egg's saved data can be applied a few ticks after the spawn: keep looking for it.
-            Some(e) => { if !convert_egg_cart(&world, &e) && tries < 40 { waiting.push((wname, id, tries + 1)); } }
-            None if tries < 40 => waiting.push((wname, id, tries + 1)), // not in the world's list yet
-            None => {}
+    let now = STATE.with(|s| s.borrow().ticks);
+    // Offset 3 keeps clear of the recovery scan (ticks 1 and 2 of every 60).
+    if now % EGG_SCAN_EVERY_TICKS != 3 { return; }
+    if server.get_all_players().is_empty() { return; }
+    for world in server.get_all_worlds() {
+        for e in world.get_entities() {
+            if matches!(e.get_type(), EntityType::Zombie) { convert_egg_cart(&world, &e); }
         }
     }
-    EGG_SPAWNS.with(|e| e.borrow_mut().extend(waiting));
 }
 
 // --- interaction ------------------------------------------------------------
@@ -1618,15 +1589,20 @@ fn cart_entity_click(player: &pumpkin_plugin_api::Player, entity_id: i32) -> boo
     cart_use(player, Some(ent))
 }
 
-/// Right-click on a rail with a minecart item that carries blocks: puts the cart and its blocks back.
-fn try_place_cart(player: &pumpkin_plugin_api::Player, pos: BlockPos) -> bool {
+/// Right-click with a minecart item that carries blocks (the cart egg): puts the cart and its blocks back, on the
+/// rail that was clicked or on top of the clicked block.
+fn try_place_cart(player: &pumpkin_plugin_api::Player, pos: BlockPos, on_rail: bool) -> bool {
     let Some(stack) = player.get_item_in_hand(Hand::Right) else { return false };
-    if norm(&stack.get_registry_key()) != "minecart" { return false; }
+    let registry_key = stack.get_registry_key();
+    let key = norm(&registry_key);
+    if key != "minecart" && key != norm(CART_EGG) { return false; }
     let Some(bytes) = item_blocks(&stack) else { return false };
     let blocks = decode_blocks(&bytes);
     if blocks.is_empty() { return false; }
     let world = player.get_world();
-    let ent = world.spawn_entity(EntityType::Minecart, (f64::from(pos.x) + 0.5, f64::from(pos.y) + 0.0625, f64::from(pos.z) + 0.5));
+    let top = if on_rail { f64::from(pos.y) + 0.0625 } else { f64::from(pos.y) + 1.0 };
+    let at = egg_cart_spot(&world, (f64::from(pos.x) + 0.5, top, f64::from(pos.z) + 0.5));
+    let ent = world.spawn_entity(EntityType::Minecart, at);
     register_cart(&world, ent, &blocks);
     if player.get_gamemode() != GameMode::Creative { player.set_item_in_hand(Hand::Right, None); }
     true

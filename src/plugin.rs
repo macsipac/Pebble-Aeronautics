@@ -25,7 +25,7 @@ use pumpkin_plugin_api::{
     commands::{Command, CommandHandler},
     common::{BlockPos, GameMode, Hand},
     events::{EventHandler, EventPriority},
-    events_wit::{BlockPlaceEventData, EntityExplodeEventData, EntitySpawnEventData, EntityInteractionAction, InteractAction, PlayerAnimationEventData, PlayerInteractEntityEventData, PlayerInteractEventData, PlayerInteractUnknownEntityEventData, PlayerToggleSneakEventData, VehicleDestroyEventData},
+    events_wit::{BlockPlaceEventData, EntityExplodeEventData, EntityInteractionAction, InteractAction, PlayerAnimationEventData, PlayerInteractEntityEventData, PlayerInteractEventData, PlayerInteractUnknownEntityEventData, PlayerToggleSneakEventData, VehicleDestroyEventData},
     permission::{Permission, PermissionDefault, PermissionLevel},
     scheduler::SchedulerExt,
     text::TextComponent,
@@ -34,7 +34,6 @@ use pumpkin_plugin_api::{
 use pumpkin_plugin_api::events::entity::entity_explode::EntityExplodeEvent;
 use pumpkin_plugin_api::events::block::block_place::BlockPlaceEvent;
 use pumpkin_plugin_api::events::vehicle::vehicle_destroy::VehicleDestroyEvent;
-use pumpkin_plugin_api::events::entity::entity_spawn::EntitySpawnEvent;
 use pumpkin_plugin_api::block_entity;
 use pumpkin_plugin_api::events::player::player_interact::PlayerInteractEvent;
 use pumpkin_plugin_api::events::player::player_interact_entity::PlayerInteractEntityEvent;
@@ -621,7 +620,9 @@ impl Plugin for Physics {
         ctx.register_event_handler::<BlockPlaceEvent, _>(PlaceFillHandler, EventPriority::Normal, false)?;
         ctx.register_event_handler::<EntityExplodeEvent, _>(ExplodeHandler, EventPriority::Lowest, false)?;
         ctx.register_event_handler::<VehicleDestroyEvent, _>(CartDestroyHandler, EventPriority::Normal, true)?;
-        ctx.register_event_handler::<EntitySpawnEvent, _>(EggCartHandler, EventPriority::Normal, false)?;
+        // NO EntitySpawnEvent handler on purpose: every spawn_entity() the plugin does from inside any of its own
+        // handlers/commands makes the server fire that event back into the (busy, single-threaded) plugin and wait
+        // for it -> deadlock of the whole server. Egg carts are found by `convert_egg_carts` instead.
         ctx.schedule_repeating_task(1, 1, tick);
         Ok(())
     }
