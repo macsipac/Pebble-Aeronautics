@@ -1652,9 +1652,30 @@ fn cart_punch(player: &pumpkin_plugin_api::Player) -> bool {
     });
     if count >= PUNCHES_TO_BREAK {
         STATE.with(|s| { s.borrow_mut().cart_punches.remove(&pid); });
-        break_cart_block(player, &h.cart, h.cell);
+        // Do NOT break the block here: this runs inside the PlayerAnimation event handler, and breaking
+        // spawns entities (loose blocks becoming bodies). Spawning fires EntitySpawnEvent, which the server
+        // dispatches back into this very plugin while it is still busy with the swing -> deadlock that
+        // freezes the whole server. Queue it and let `process_cart_breaks` do it from the tick instead.
+        PUNCH_CART_BREAKS.with(|q| { let mut q = q.borrow_mut(); if q.len() < 64 { q.push((pid, h.cart.id, h.cell)); } });
     }
     true
+}
+
+thread_local! {
+    /// (player entity id, cart id, cell) of cart blocks whose third punch landed; see `cart_punch`.
+    static PUNCH_CART_BREAKS: RefCell<Vec<(u32, u32, [i32; 3])>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Runs the cart block breaks queued by `cart_punch`, from the tick (outside any event handler).
+pub(super) fn process_cart_breaks(server: &Server) {
+    let pending = PUNCH_CART_BREAKS.with(|q| std::mem::take(&mut *q.borrow_mut()));
+    if pending.is_empty() { return; }
+    let players = server.get_all_players();
+    for (pid, cart_id, cell) in pending {
+        let Some(player) = players.iter().find(|p| p.as_entity().get_id() == pid) else { continue };
+        let Some(cart) = STATE.with(|s| s.borrow().carts.get(&cart_id).cloned()) else { continue };
+        break_cart_block(player, &cart, cell);
+    }
 }
 
 /// Blocks that are no longer connected (face to face) to the cart fall off and become normal physics bodies.

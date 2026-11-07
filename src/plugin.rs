@@ -312,6 +312,7 @@ fn tick(server: Server) {
     housekeeping(&server);
     flush_pending_anchors();
     lap(PROF_HOUSE, &mut t);
+    process_cart_breaks(&server);
     process_fill(&server);
     process_blasts(&server);
     lap(PROF_TNT, &mut t);
