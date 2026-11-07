@@ -23,7 +23,7 @@
 //! * Unloaded chunks are treated as solid so nothing falls into the void while
 //!   terrain is missing.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use rapier3d::prelude::*;
@@ -197,19 +197,6 @@ pub struct Hit {
     pub normal_local: [i32; 3],
 }
 
-/// A player (or other entity) that can shove bodies around.
-#[derive(Clone, Copy, Debug)]
-pub struct PusherInput {
-    /// Unique key, e.g. the entity id.
-    pub key: u64,
-    /// Feet position in world coordinates.
-    pub feet: [f64; 3],
-    /// Half of the entity width.
-    pub half_width: f32,
-    /// Entity height.
-    pub height: f32,
-}
-
 /// Where a body currently is.
 #[derive(Clone, Copy, Debug)]
 pub struct BodyUpdate {
@@ -262,11 +249,6 @@ struct Body {
     sent_asleep: bool,
 }
 
-struct Pusher {
-    handle: RigidBodyHandle,
-    last_feet: Vector,
-}
-
 /// The physics world for one Minecraft dimension.
 pub struct Engine {
     cfg: Config,
@@ -275,7 +257,6 @@ pub struct Engine {
     cells: HashMap<Cell, CellEntry>,
     infos: HashMap<u16, Arc<StateInfo>>,
     bodies: HashMap<BodyId, Body>,
-    pushers: HashMap<u64, Pusher>,
     next_id: BodyId,
     tick: u64,
     /// Floating origin: engine coordinates = world coordinates - origin (keeps f32 precise).
@@ -307,7 +288,6 @@ impl Engine {
             cells: HashMap::new(),
             infos: HashMap::new(),
             bodies: HashMap::new(),
-            pushers: HashMap::new(),
             next_id: 1,
             tick: 0,
             origin: None,
@@ -623,15 +603,11 @@ impl Engine {
         }
     }
 
-    /// Removes every body (terrain cache and pushers are dropped too).
+    /// Removes every body (the terrain cache is dropped too).
     pub fn clear(&mut self) {
         let ids = self.ids();
         for id in ids {
             self.remove(id);
-        }
-        let keys: Vec<u64> = self.pushers.keys().copied().collect();
-        for k in keys {
-            self.remove_pusher(k);
         }
         let cells: Vec<Cell> = self.cells.keys().copied().collect();
         for c in cells {
@@ -777,64 +753,6 @@ impl Engine {
         let impulse = impulse.min(mass * max_dv);
         rb.apply_impulse_at_point(d * impulse, point, true);
         true
-    }
-
-    // ------------------------------------------------------------------
-    // pushers (players)
-    // ------------------------------------------------------------------
-
-    fn remove_pusher(&mut self, key: u64) {
-        if let Some(p) = self.pushers.remove(&key) {
-            self.world.remove_body_with_colliders(p.handle, true);
-        }
-    }
-
-    fn update_pushers(&mut self, inputs: &[PusherInput]) {
-        let present: HashSet<u64> = inputs.iter().map(|p| p.key).collect();
-        let stale: Vec<u64> = self.pushers.keys().filter(|k| !present.contains(k)).copied().collect();
-        for k in stale {
-            self.remove_pusher(k);
-        }
-        if self.bodies.is_empty() {
-            let all: Vec<u64> = self.pushers.keys().copied().collect();
-            for k in all {
-                self.remove_pusher(k);
-            }
-            return;
-        }
-        for input in inputs {
-            let feet = self.to_local(input.feet);
-            let near = self.bodies.values().any(|b| {
-                let t = self.world.bodies[b.handle].translation();
-                (t - feet).length_squared() < 6.0 * 6.0
-            });
-            if !near {
-                self.remove_pusher(input.key);
-                continue;
-            }
-            match self.pushers.get_mut(&input.key) {
-                Some(p) => {
-                    let rb = &mut self.world.bodies[p.handle];
-                    if (feet - p.last_feet).length() > 3.0 {
-                        // Teleport: move without imparting velocity.
-                        rb.set_translation(feet, false);
-                    } else {
-                        rb.set_next_kinematic_translation(feet);
-                    }
-                    p.last_feet = feet;
-                }
-                None => {
-                    let rb = RigidBodyBuilder::kinematic_position_based().translation(feet).build();
-                    let handle = self.world.insert_body(rb);
-                    let collider = ColliderBuilder::cuboid(input.half_width, input.height * 0.5, input.half_width)
-                        .translation(Vector::new(0.0, input.height * 0.5, 0.0))
-                        .friction(0.0)
-                        .build();
-                    self.world.insert_collider(collider, Some(handle));
-                    self.pushers.insert(input.key, Pusher { handle, last_feet: feet });
-                }
-            }
-        }
     }
 
     // ------------------------------------------------------------------
@@ -1098,12 +1016,11 @@ impl Engine {
     // ------------------------------------------------------------------
 
     /// Advances the simulation by one game tick and reports bodies whose visuals changed.
-    pub fn tick(&mut self, view: &mut dyn WorldView, pushers: &[PusherInput]) -> Vec<BodyUpdate> {
+    pub fn tick(&mut self, view: &mut dyn WorldView) -> Vec<BodyUpdate> {
         self.tick += 1;
         if self.bodies.is_empty() {
             return Vec::new();
         }
-        self.update_pushers(pushers);
         self.refresh_terrain(view);
 
         let max_speed = self.cfg.max_speed;
@@ -1241,14 +1158,14 @@ mod tests {
     fn run(e: &mut Engine, w: &mut Fake, ticks: usize) -> Vec<BodyUpdate> {
         let mut last = Vec::new();
         for _ in 0..ticks {
-            last = e.tick(w, &[]);
+            last = e.tick(w);
         }
         last
     }
 
     fn run_until_asleep(e: &mut Engine, w: &mut Fake, id: BodyId, max_ticks: usize) -> usize {
         for t in 0..max_ticks {
-            e.tick(w, &[]);
+            e.tick(w);
             if e.body_state(id).is_some_and(|s| s.2) {
                 return t;
             }
@@ -1310,7 +1227,7 @@ mod tests {
             let id = e.spawn(&block(1600.0, 0.7, restitution), [0.5, 6.5, 0.5]);
             let mut impact = 0.0f32;
             for _ in 0..80 {
-                e.tick(&mut world, &[]);
+                e.tick(&mut world);
                 let vy = e.velocity(id).unwrap()[1];
                 if vy < impact {
                     impact = vy;
@@ -1457,23 +1374,6 @@ mod tests {
         let hit = e.raycast([20.0, 50.5, 0.5], [-1.0, 0.0, 0.0], 20.0).unwrap();
         assert_eq!(hit.body, b);
         assert!(e.raycast([-5.0, 60.0, 0.5], [1.0, 0.0, 0.0], 20.0).is_none());
-    }
-
-    #[test]
-    fn a_walking_player_shoves_a_block() {
-        let mut world = Fake::flat(0, STONE);
-        let mut e = Engine::new(Config::default());
-        let id = e.spawn(&block(700.0, 0.4, 0.1), [3.5, 1.5, 0.5]);
-        run(&mut e, &mut world, 5);
-        // Player walks +x at 4 m/s, starting 2 blocks behind the block.
-        let mut x = 1.0f64;
-        for _ in 0..40 {
-            x += 4.0 * 0.05;
-            let p = PusherInput { key: 1, feet: [x, 1.0, 0.5], half_width: 0.3, height: 1.8 };
-            e.tick(&mut world, &[p]);
-        }
-        let (p, _, _) = e.body_state(id).unwrap();
-        assert!(p[0] > 4.5, "block should have been pushed, x={}", p[0]);
     }
 
     #[test]
