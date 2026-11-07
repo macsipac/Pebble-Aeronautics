@@ -609,15 +609,18 @@ impl Plugin for Physics {
             .then(CommandNode::literal("assemble").execute(AssembleCmd))
             .then(CommandNode::literal("profile").execute(ProfileCmd));
         ctx.register_command(cmd, PERM_USE);
+        // Only handlers that cancel or change their event are registered as blocking (the server waits for
+        // them, usually while holding its own locks, and they call back into the server). Handlers that just
+        // take note (swings, explosions, spawns) are not, so they can never hold the server up.
         ctx.register_event_handler::<PlayerToggleSneakEvent, _>(SneakHandler, EventPriority::Normal, false)?;
-        ctx.register_event_handler::<PlayerAnimationEvent, _>(AnimHandler, EventPriority::Normal, true)?;
+        ctx.register_event_handler::<PlayerAnimationEvent, _>(AnimHandler, EventPriority::Normal, false)?;
         ctx.register_event_handler::<PlayerInteractEntityEvent, _>(EntityHandler, EventPriority::Normal, true)?;
         ctx.register_event_handler::<PlayerInteractUnknownEntityEvent, _>(UnknownEntityHandler, EventPriority::Normal, true)?;
         ctx.register_event_handler::<PlayerInteractEvent, _>(UseHandler, EventPriority::Normal, true)?;
         ctx.register_event_handler::<BlockPlaceEvent, _>(PlaceFillHandler, EventPriority::Normal, false)?;
-        ctx.register_event_handler::<EntityExplodeEvent, _>(ExplodeHandler, EventPriority::Lowest, true)?;
+        ctx.register_event_handler::<EntityExplodeEvent, _>(ExplodeHandler, EventPriority::Lowest, false)?;
         ctx.register_event_handler::<VehicleDestroyEvent, _>(CartDestroyHandler, EventPriority::Normal, true)?;
-        ctx.register_event_handler::<EntitySpawnEvent, _>(EggCartHandler, EventPriority::Normal, true)?;
+        ctx.register_event_handler::<EntitySpawnEvent, _>(EggCartHandler, EventPriority::Normal, false)?;
         ctx.schedule_repeating_task(1, 1, tick);
         Ok(())
     }

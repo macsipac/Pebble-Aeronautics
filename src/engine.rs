@@ -197,6 +197,14 @@ pub struct Hit {
     pub normal_local: [i32; 3],
 }
 
+/// Bodies farther than this from the engine origin (blocks) are thrown away as broken.
+const MAX_COORD: f32 = 1.0e6;
+/// Angular speed cap (rad/s), the rotational twin of `Config::max_speed`.
+const MAX_SPIN: f32 = 60.0;
+/// A body whose neighbourhood would need more cells than this is skipped by the terrain refresh for the tick
+/// instead of walking a (possibly astronomically large) box of cells.
+const MAX_REFRESH_CELLS: i64 = 200_000;
+
 /// Where a body currently is.
 #[derive(Clone, Copy, Debug)]
 pub struct BodyUpdate {
@@ -855,6 +863,7 @@ impl Engine {
 
         for (h, aabb) in handles {
             let Some((min, max)) = aabb else { continue };
+            if !min.is_finite() || !max.is_finite() { continue; }
             let rb = &self.world.bodies[h];
             let asleep = rb.is_sleeping();
             let speed = rb.linvel().length();
@@ -862,6 +871,8 @@ impl Engine {
             let lo = self.local_to_cell(min - Vector::splat(margin));
             let hi = self.local_to_cell(max + Vector::splat(margin));
             let interval = if asleep { self.cfg.sleep_refresh_ticks } else { self.cfg.awake_refresh_ticks };
+            let cells = (0..3).map(|i| (i64::from(hi[i]) - i64::from(lo[i]) + 1).max(0)).product::<i64>();
+            if cells > MAX_REFRESH_CELLS { continue; }
             for x in lo[0]..=hi[0] {
                 for y in lo[1]..=hi[1] {
                     for z in lo[2]..=hi[2] {
@@ -1021,6 +1032,23 @@ impl Engine {
         if self.bodies.is_empty() {
             return Vec::new();
         }
+        // A body whose state went non-finite (or absurdly far away) must never reach the terrain scan or the
+        // solver: NaN/inf there can make them spin forever, which freezes the whole server tick.
+        let mut dead = Vec::new();
+        for (id, b) in &self.bodies {
+            let rb = &self.world.bodies[b.handle];
+            let p = rb.translation();
+            if !p.is_finite() || p.abs().max_element() > MAX_COORD || !rb.rotation().is_finite() {
+                dead.push(*id);
+            }
+        }
+        for id in &dead {
+            self.remove(*id);
+        }
+        if self.bodies.is_empty() {
+            return dead.into_iter().map(|id| BodyUpdate { id, pos: [0.0; 3], rot: [0.0, 0.0, 0.0, 1.0], asleep: true, removed: true }).collect();
+        }
+
         self.refresh_terrain(view);
 
         let max_speed = self.cfg.max_speed;
@@ -1028,14 +1056,24 @@ impl Engine {
             let wet = self.apply_fluid_forces();
             self.world.step();
             self.apply_fluid_drag(&wet);
-            // Safety net against runaway velocities.
+            // Safety net against runaway (or broken) velocities.
             for b in self.bodies.values() {
                 let rb = &mut self.world.bodies[b.handle];
                 if !rb.is_sleeping() {
                     let v = rb.linvel();
+                    let w = rb.angvel();
+                    if !v.is_finite() || !w.is_finite() {
+                        rb.set_linvel(Vector::ZERO, false);
+                        rb.set_angvel(Vector::ZERO, false);
+                        continue;
+                    }
                     let s = v.length();
                     if s > max_speed {
                         rb.set_linvel(v * (max_speed / s), false);
+                    }
+                    let ws = w.length();
+                    if ws > MAX_SPIN {
+                        rb.set_angvel(w * (MAX_SPIN / ws), false);
                     }
                 }
             }
@@ -1044,7 +1082,6 @@ impl Engine {
         let origin = self.origin();
         let void_y = (view.min_y() as f32) - self.cfg.void_margin - origin[1] as f32;
         let mut updates = Vec::new();
-        let mut dead = Vec::new();
         let ids: Vec<BodyId> = self.bodies.keys().copied().collect();
         for id in ids {
             let (handle, never_sent, sent_asleep, last_pos, last_rot) = {
