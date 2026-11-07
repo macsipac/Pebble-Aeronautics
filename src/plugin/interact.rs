@@ -1071,63 +1071,21 @@ fn decode_blocks(b: &[u8]) -> Vec<CartBlock> {
     out
 }
 
-/// A loaded cart is handed out as an allay spawn egg dressed up as a minecart. Pumpkin spawns the entity its
-/// `entity_data` names and loads that data into it, so placing it, dispensing it and `/give` all work without
-/// any event hooks; `convert_egg_cart` then swaps the freshly spawned allay for a minecart carrying the blocks.
-const CART_EGG: &str = "minecraft:zombie_spawn_egg";
-/// Entity type id of an allay, used only if the default egg doesn't reveal it (id in Pumpkin's entities.json).
-const ALLAY_TYPE_ID_FALLBACK: u32 = 154; // zombie (name kept from the allay version)
+/// A loaded cart is handed out as a recovery compass dressed up as a minecart (model, name, glint). The blocks
+/// travel in its custom-data; right-clicking a block with it is handled by `try_place_cart`.
+const CART_ITEM: &str = "minecraft:recovery_compass";
 
-/// A VarInt (ids above 127 take two bytes, so a lone byte would be a broken value).
-fn varint_bytes(mut n: u32) -> Vec<u8> {
-    let mut v = Vec::new();
-    loop {
-        let b = (n & 0x7f) as u8;
-        n >>= 7;
-        if n == 0 { v.push(b); return v; }
-        v.push(b | 0x80);
-    }
-}
-/// The leading VarInt of a component value.
-fn varint_prefix(v: &[u8]) -> Vec<u8> {
-    let n = v.iter().position(|b| b & 0x80 == 0).map_or(v.len(), |i| i + 1);
-    v[..n].to_vec()
-}
 /// Starts a named NBT tag (type byte, then the name).
 fn nbt_name(v: &mut Vec<u8>, tag: u8, name: &str) {
     v.push(tag);
     v.extend_from_slice(&(name.len() as u16).to_be_bytes());
     v.extend_from_slice(name.as_bytes());
 }
-/// `entity_data` for the egg: the allay's type id (read off the default egg) and the NBT
-/// `{data: {<TAG_NS>: {cart: [B; ...]}}}`, which is where an entity's custom data lives.
-fn egg_entity_data(blocks: &[u8]) -> Vec<u8> {
-    let mut v = ItemStack::of(CART_EGG, 1).get_components().into_iter()
-        .find(|c| is_comp(c.component, "entity-data")).map(|c| varint_prefix(&c.value))
-        .filter(|p| !p.is_empty()).unwrap_or_else(|| varint_bytes(ALLAY_TYPE_ID_FALLBACK));
-    v.push(10); // unnamed root compound
-    // The zombie only exists for a moment before it becomes the cart: no AI, gravity, noise or damage, not a
-    // baby.
-    for flag in ["Invulnerable", "NoAI", "NoGravity", "Silent", "Invisible"] {
-        nbt_name(&mut v, 1, flag);
-        v.push(1);
-    }
-    nbt_name(&mut v, 1, "IsBaby");
-    v.push(0);
-    nbt_name(&mut v, 10, "data");
-    nbt_name(&mut v, 10, TAG_NS);
-    nbt_name(&mut v, 7, CART_KEY);
-    v.extend_from_slice(&(blocks.len() as i32).to_be_bytes());
-    v.extend_from_slice(blocks);
-    v.extend_from_slice(&[0, 0, 0]); // end of TAG_NS, data, root
-    v
-}
-
-/// A minecart item; with blocks it is the egg described at `CART_EGG`, looking like a minecart and glinting.
+/// A minecart item; with blocks it is the recovery compass described at `CART_ITEM`, looking like a minecart and glinting.
 fn cart_item(blocks: &[u8]) -> ItemStack {
     if blocks.len() <= CART_MAGIC.len() { return ItemStack::of("minecraft:minecart", 1); }
-    let s = ItemStack::of(CART_EGG, 1);
-    if let Some(c) = comp_by_name("entity-data") { s.set_component(c, &egg_entity_data(blocks)); }
+    let s = ItemStack::of(CART_ITEM, 1);
+    if let Some(c) = comp_by_name("custom-data") { s.set_component(c, &custom_data_with(CART_KEY.as_bytes(), blocks)); }
     if let Some(c) = comp_by_name("item-model") {
         let id = "minecraft:minecart";
         let mut v = vec![id.len() as u8];
@@ -1147,9 +1105,12 @@ fn cart_item(blocks: &[u8]) -> ItemStack {
     if let Some(c) = comp_by_name("enchantment-glint-override") { s.set_component(c, &vec![1u8]); }
     s
 }
-/// The saved blocks an item carries: in the egg's entity-data.
+/// The saved blocks an item carries: in its custom-data. (Items made by older versions kept them in an egg's
+/// entity-data; those are still read so they keep working.)
 fn item_blocks(stack: &ItemStack) -> Option<Vec<u8>> {
-    stack.get_components().iter().find(|c| is_comp(c.component, "entity-data")).and_then(|c| custom_data_get(CART_KEY.as_bytes(), &c.value))
+    let comps = stack.get_components();
+    comps.iter().find(|c| is_comp(c.component, "custom-data")).and_then(|c| custom_data_get(CART_KEY.as_bytes(), &c.value))
+        .or_else(|| comps.iter().find(|c| is_comp(c.component, "entity-data")).and_then(|c| custom_data_get(CART_KEY.as_bytes(), &c.value)))
 }
 
 // --- building, saving, registering -----------------------------------------
@@ -1293,7 +1254,6 @@ pub(super) fn save_carts(force: bool) {
 
 /// Per-tick: handles broken carts, and moves every cart's blocks along with it (turning them with it).
 pub(super) fn cart_tick(server: &Server) {
-    convert_egg_carts(server);
     let breaks = CART_BREAKS.with(|b| std::mem::take(&mut *b.borrow_mut()));
     for (eid, attacker) in breaks {
         let Some(c) = STATE.with(|s| s.borrow().carts.get(&(eid as u32)).cloned()) else { continue };
@@ -1375,8 +1335,8 @@ impl EventHandler<VehicleDestroyEvent> for CartDestroyHandler {
     }
 }
 
-/// Where the cart goes: on the rail at or just under the spawned allay, else where the allay stood.
-fn egg_cart_spot(world: &World, p: (f64, f64, f64)) -> (f64, f64, f64) {
+/// Where a placed cart goes: on the rail at or just under `p`, else at `p`.
+fn cart_spot(world: &World, p: (f64, f64, f64)) -> (f64, f64, f64) {
     let (x, z) = (p.0.floor() as i32, p.2.floor() as i32);
     let y = (p.1 + 0.1).floor() as i32;
     for dy in [0, -1] {
@@ -1387,41 +1347,6 @@ fn egg_cart_spot(world: &World, p: (f64, f64, f64)) -> (f64, f64, f64) {
         }
     }
     p
-}
-
-/// An allay carrying saved cart blocks (it came out of a cart egg) is replaced by a minecart with them.
-/// False for an ordinary allay.
-fn convert_egg_cart(world: &World, e: &Entity) -> bool {
-    let Some(saved) = e.get_byte_array(TAG_NS, CART_KEY) else { return false };
-    let blocks = decode_blocks(&saved.iter().map(|b| *b as u8).collect::<Vec<u8>>());
-    if blocks.is_empty() { return false; }
-    let at = egg_cart_spot(world, e.get_position());
-    e.remove();
-    let cart = world.spawn_entity(EntityType::Minecart, at);
-    register_cart(world, cart, &blocks);
-    true
-}
-
-/// Called by the recovery scan for every allay (catches one the spawn event missed).
-pub(super) fn egg_cart_adopt(world: &World, e: &Entity) { convert_egg_cart(world, e); }
-
-/// How often (ticks) the entities are checked for a cart egg that something other than a player click spawned
-/// (dispenser, `/summon`, `/give` + other mods). Players placing the egg never wait for this.
-const EGG_SCAN_EVERY_TICKS: u64 = 4;
-
-/// Finds cart eggs spawned without a click (dispensers). There is deliberately no EntitySpawnEvent handler (it
-/// deadlocks the server, see `Physics::on_load`), so this walks the entities every few ticks while players are
-/// online. The placeholder zombie is invisible and has no AI, so the short wait is not noticeable.
-fn convert_egg_carts(server: &Server) {
-    let now = STATE.with(|s| s.borrow().ticks);
-    // Offset 3 keeps clear of the recovery scan (ticks 1 and 2 of every 60).
-    if now % EGG_SCAN_EVERY_TICKS != 3 { return; }
-    if server.get_all_players().is_empty() { return; }
-    for world in server.get_all_worlds() {
-        for e in world.get_entities() {
-            if matches!(e.get_type(), EntityType::Zombie) { convert_egg_cart(&world, &e); }
-        }
-    }
 }
 
 // --- interaction ------------------------------------------------------------
@@ -1589,19 +1514,16 @@ fn cart_entity_click(player: &pumpkin_plugin_api::Player, entity_id: i32) -> boo
     cart_use(player, Some(ent))
 }
 
-/// Right-click with a minecart item that carries blocks (the cart egg): puts the cart and its blocks back, on the
+/// Right-click with an item that carries cart blocks (the cart compass): puts the cart and its blocks back, on the
 /// rail that was clicked or on top of the clicked block.
 fn try_place_cart(player: &pumpkin_plugin_api::Player, pos: BlockPos, on_rail: bool) -> bool {
     let Some(stack) = player.get_item_in_hand(Hand::Right) else { return false };
-    let registry_key = stack.get_registry_key();
-    let key = norm(&registry_key);
-    if key != "minecart" && key != norm(CART_EGG) { return false; }
     let Some(bytes) = item_blocks(&stack) else { return false };
     let blocks = decode_blocks(&bytes);
     if blocks.is_empty() { return false; }
     let world = player.get_world();
     let top = if on_rail { f64::from(pos.y) + 0.0625 } else { f64::from(pos.y) + 1.0 };
-    let at = egg_cart_spot(&world, (f64::from(pos.x) + 0.5, top, f64::from(pos.z) + 0.5));
+    let at = cart_spot(&world, (f64::from(pos.x) + 0.5, top, f64::from(pos.z) + 0.5));
     let ent = world.spawn_entity(EntityType::Minecart, at);
     register_cart(&world, ent, &blocks);
     if player.get_gamemode() != GameMode::Creative { player.set_item_in_hand(Hand::Right, None); }

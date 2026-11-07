@@ -81,6 +81,8 @@ thread_local! {
 /// up in the player list can still be finishing the join sequence (login / configuration / world
 /// load); a spawn packet arriving then is a protocol violation and the client disconnects.
 const JOIN_GRACE_TICKS: u64 = 200;
+/// Earliest a joining / world-changing player can be treated as loaded, even if they seem to move.
+const JOIN_MIN_TICKS: u64 = 60;
 /// What `sync_colliders` knows about a player's join: when it first saw them in this world, where they
 /// stood and looked on the previous tick (kept in memory only, refreshed every tick while the player is
 /// not ready yet; any change from it means the client is in the world), and whether they are cleared
@@ -167,7 +169,11 @@ pub(super) fn sync_colliders(server: &Server) {
                     || (look.1 - ent.look.1).abs() > 0.01;
                 ent.pos = pos;
                 ent.look = look;
-                if changed || now.saturating_sub(ent.first) >= JOIN_GRACE_TICKS { ent.ready = true; }
+                let waited = now.saturating_sub(ent.first);
+                // Never before JOIN_MIN_TICKS: the server moving the player (spawn teleport) looks like movement but
+                // says nothing about the client having finished loading. A shulker spawn that reaches a client
+                // without a level makes it crash with a network protocol error (NPE in Entity.<init>).
+                if (changed && waited >= JOIN_MIN_TICKS) || waited >= JOIN_GRACE_TICKS { ent.ready = true; }
             }
             ent.ready
         });

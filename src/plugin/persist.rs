@@ -330,7 +330,6 @@ fn recover(server: &Server) -> bool {
             // entities instead of two.
             let ty = e.get_type();
             if matches!(ty, EntityType::Minecart) { cart_adopt(&world, e); continue; }
-            if matches!(ty, EntityType::Zombie) { egg_cart_adopt(&world, &e); continue; }
             if !matches!(ty, EntityType::BlockDisplay) { continue; }
             let id = e.get_id();
             loaded.insert(id);

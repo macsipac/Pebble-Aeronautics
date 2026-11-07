@@ -620,9 +620,8 @@ impl Plugin for Physics {
         ctx.register_event_handler::<BlockPlaceEvent, _>(PlaceFillHandler, EventPriority::Normal, false)?;
         ctx.register_event_handler::<EntityExplodeEvent, _>(ExplodeHandler, EventPriority::Lowest, false)?;
         ctx.register_event_handler::<VehicleDestroyEvent, _>(CartDestroyHandler, EventPriority::Normal, true)?;
-        // NO EntitySpawnEvent handler on purpose: every spawn_entity() the plugin does from inside any of its own
-        // handlers/commands makes the server fire that event back into the (busy, single-threaded) plugin and wait
-        // for it -> deadlock of the whole server. Egg carts are found by `convert_egg_carts` instead.
+        // No EntitySpawnEvent handler on purpose: every spawn_entity() from inside the plugin's own handlers would
+        // make the server fire it back into the busy plugin and wait for it -> deadlock of the whole server.
         ctx.schedule_repeating_task(1, 1, tick);
         Ok(())
     }
