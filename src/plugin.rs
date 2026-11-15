@@ -25,7 +25,7 @@ use pumpkin_plugin_api::{
     commands::{Command, CommandHandler},
     common::{BlockPos, GameMode, Hand},
     events::{EventHandler, EventPriority},
-    events_wit::{BlockPlaceEventData, EntityExplodeEventData, EntityInteractionAction, InteractAction, PlayerAnimationEventData, PlayerInteractEntityEventData, PlayerInteractEventData, PlayerInteractUnknownEntityEventData, PlayerToggleSneakEventData, VehicleDestroyEventData},
+    events_wit::{BlockBreakEventData, BlockPlaceEventData, EntityExplodeEventData, EntityInteractionAction, InteractAction, PlayerAnimationEventData, PlayerInteractEntityEventData, PlayerInteractEventData, PlayerInteractUnknownEntityEventData, PlayerToggleSneakEventData, VehicleDestroyEventData},
     permission::{Permission, PermissionDefault, PermissionLevel},
     scheduler::SchedulerExt,
     text::TextComponent,
@@ -33,12 +33,13 @@ use pumpkin_plugin_api::{
 };
 use pumpkin_plugin_api::events::entity::entity_explode::EntityExplodeEvent;
 use pumpkin_plugin_api::events::block::block_place::BlockPlaceEvent;
+use pumpkin_plugin_api::events::block::block_break::BlockBreakEvent;
 use pumpkin_plugin_api::events::vehicle::vehicle_destroy::VehicleDestroyEvent;
 use pumpkin_plugin_api::block_entity;
 use pumpkin_plugin_api::events::player::player_interact::PlayerInteractEvent;
 use pumpkin_plugin_api::events::player::player_interact_entity::PlayerInteractEntityEvent;
 use pumpkin_plugin_api::events::player::player_interact_unknown_entity::PlayerInteractUnknownEntityEvent;
-use pumpkin_plugin_api::java_packets::{CRemoveEntities, CSetEntityMetadata, CSpawnEntity, ClientboundPacket};
+use pumpkin_plugin_api::java_packets::{CRemoveEntities, CSetEntityMetadata, CSetPassengers, CSpawnEntity, ClientboundPacket};
 use pumpkin_plugin_api::data_components::DataComponent;
 use pumpkin_plugin_api::uuid::Uuid;
 use pumpkin_plugin_api::gui::Gui;
@@ -51,11 +52,13 @@ use pumpkin_plugin_api::events::player::player_toggle_sneak::PlayerToggleSneakEv
 use crate::engine::*;
 use crate::materials::{friction_from_slipperiness, material_for};
 
+mod config;
 mod interact;
 mod persist;
 mod registry_ids;
 mod visuals;
 
+use config::cfg;
 use interact::*;
 use persist::*;
 use visuals::*;
@@ -156,7 +159,7 @@ thread_local! {
 }
 
 thread_local! {
-    /// Entity ids of every display and collider anchor this plugin owns. Entity queries return them too,
+    /// Entity ids of every display this plugin owns. Entity queries return them too,
     /// and telling "ours" from "somebody else's" by id costs one host call instead of several.
     static OWN_IDS: RefCell<HashSet<u32>> = RefCell::new(HashSet::new());
 }
@@ -237,11 +240,15 @@ impl WorldView for View<'_> {
     fn min_y(&self) -> i32 { self.world.get_min_y() }
 }
 
+fn is_leaves_state(state: u16) -> bool {
+    world::block_state_to_info(state).is_some_and(|i| i.name.trim_start_matches("minecraft:").ends_with("_leaves"))
+}
+
 fn part_for(info: &StateInfo, offset: [i32; 3]) -> Part {
     let boxes = if !info.boxes.is_empty() { info.boxes.clone() }
         else if !info.outline.is_empty() { info.outline.clone() }
         else { vec![[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]] };
-    Part { offset, boxes, density: info.density, friction: info.friction, restitution: info.restitution }
+    Part { offset, boxes, density: info.density, friction: info.friction, restitution: info.restitution, ghost: false }
 }
 
 /// Does this block state get a client-side collision shulker? True for anything that blocks movement
@@ -314,6 +321,8 @@ fn tick(server: Server) {
     process_cart_breaks(&server);
     process_fill(&server);
     process_blasts(&server);
+    process_tree_falls(&server);
+    process_leaf_decay(&server);
     lap(PROF_TNT, &mut t);
     apply_grabs(&server);
     lap(PROF_GRAB, &mut t);
@@ -390,8 +399,12 @@ fn spawn_body_rotated(world: &World, blocks: &[(Cell, u16)], anchor: Cell, spawn
         let eng = st.engines.entry(wname.clone()).or_insert_with(|| Engine::new(Config::default()));
         for (cell, state) in blocks {
             let info = eng.info(&mut view, *state);
-            solid.push(is_full_block(&info, *state));
-            specs.push(part_for(&info, [cell[0] - anchor[0], cell[1] - anchor[1], cell[2] - anchor[2]]));
+            // Leaves are ghosts (no collision, so also no client-side collision shulker).
+            let ghost = cfg().leaves_ghost && is_leaves_state(*state);
+            solid.push(is_full_block(&info, *state) && !ghost);
+            let mut part = part_for(&info, [cell[0] - anchor[0], cell[1] - anchor[1], cell[2] - anchor[2]]);
+            part.ghost = ghost;
+            specs.push(part);
         }
     });
 
@@ -589,12 +602,13 @@ impl Plugin for Physics {
         PluginMetadata {
             name: "physics".into(), version: "0.3.0".into(), authors: vec![],
             description: "Rigid-body physics for block displays (/physics)".into(),
-            dependencies: vec![], permissions: vec![],
+            dependencies: vec![], permissions: vec!["fs.read.data".into(), "fs.write.data".into()],
         }
     }
     fn on_load(&self, ctx: Context) -> Result<(), String> {
         let session = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_millis() as i64).max(1);
         SESSION.with(|c| c.set(session));
+        config::load(&ctx.get_data_folder());
         ctx.register_permission(&Permission {
             node: PERM_USE.into(), description: "Use /physics assemble".into(),
             default: PermissionDefault::Allow, children: vec![],
@@ -618,6 +632,7 @@ impl Plugin for Physics {
         ctx.register_event_handler::<PlayerInteractUnknownEntityEvent, _>(UnknownEntityHandler, EventPriority::Normal, true)?;
         ctx.register_event_handler::<PlayerInteractEvent, _>(UseHandler, EventPriority::Normal, true)?;
         ctx.register_event_handler::<BlockPlaceEvent, _>(PlaceFillHandler, EventPriority::Normal, false)?;
+        ctx.register_event_handler::<BlockBreakEvent, _>(TreeBreakHandler, EventPriority::Normal, true)?;
         ctx.register_event_handler::<EntityExplodeEvent, _>(ExplodeHandler, EventPriority::Lowest, false)?;
         ctx.register_event_handler::<VehicleDestroyEvent, _>(CartDestroyHandler, EventPriority::Normal, true)?;
         // No EntitySpawnEvent handler on purpose: every spawn_entity() from inside the plugin's own handlers would

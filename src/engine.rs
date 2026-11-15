@@ -145,6 +145,8 @@ pub struct Part {
     pub friction: f32,
     /// Restitution coefficient.
     pub restitution: f32,
+    /// Ghost part: keeps its mass but has no collision at all (a sensor), so it passes through everything.
+    pub ghost: bool,
 }
 
 /// Physical description of a body to spawn: one or more rigidly connected blocks.
@@ -158,7 +160,7 @@ impl BodySpec {
     /// A body made of a single block.
     #[must_use]
     pub fn single(boxes: Vec<[f32; 6]>, density: f32, friction: f32, restitution: f32) -> Self {
-        Self { parts: vec![Part { offset: [0, 0, 0], boxes, density, friction, restitution }] }
+        Self { parts: vec![Part { offset: [0, 0, 0], boxes, density, friction, restitution, ghost: false }] }
     }
 }
 
@@ -245,6 +247,7 @@ struct PartRt {
     density: f32,
     friction: f32,
     restitution: f32,
+    ghost: bool,
 }
 
 struct Body {
@@ -408,6 +411,7 @@ impl Engine {
                 .restitution(part.restitution)
                 .friction_combine_rule(CoefficientCombineRule::Min)
                 .restitution_combine_rule(CoefficientCombineRule::Max)
+                .sensor(part.ghost)
                 .build();
             colliders.push(world.insert_collider(collider, Some(handle)));
 
@@ -433,6 +437,7 @@ impl Engine {
             density: part.density,
             friction: part.friction,
             restitution: part.restitution,
+            ghost: part.ghost,
         }
     }
 
@@ -574,7 +579,7 @@ impl Engine {
                 for c in &old.colliders {
                     self.world.remove_collider(*c);
                 }
-                let spec = Part { offset: old.offset, boxes: old.boxes.clone(), density: old.density, friction: old.friction, restitution: old.restitution };
+                let spec = Part { offset: old.offset, boxes: old.boxes.clone(), density: old.density, friction: old.friction, restitution: old.restitution, ghost: old.ghost };
                 let rt = Self::build_part(&mut self.world, new_handle, old.id, &spec, n);
                 ids.push(rt.id);
                 parts.push(rt);
@@ -1432,7 +1437,7 @@ mod tests {
     }
 
     fn row(n: i32) -> BodySpec {
-        BodySpec { parts: (0..n).map(|i| Part { offset: [i, 0, 0], boxes: vec![[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]], density: 1600.0, friction: 0.7, restitution: 0.05 }).collect() }
+        BodySpec { parts: (0..n).map(|i| Part { offset: [i, 0, 0], boxes: vec![[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]], density: 1600.0, friction: 0.7, restitution: 0.05, ghost: false }).collect() }
     }
 
     #[test]
@@ -1476,7 +1481,7 @@ mod tests {
         run(&mut e, &mut world, 1);
         let hit = e.raycast([-5.0, 50.5, 0.5], [1.0, 0.0, 0.0], 20.0).unwrap();
         assert_eq!(hit.normal_local, [-1, 0, 0]);
-        let part = Part { offset: [-1, 0, 0], boxes: vec![[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]], density: 1600.0, friction: 0.7, restitution: 0.05 };
+        let part = Part { offset: [-1, 0, 0], boxes: vec![[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]], density: 1600.0, friction: 0.7, restitution: 0.05, ghost: false };
         let pid = e.add_part(id, &part).unwrap();
         assert!(e.add_part(id, &part).is_none(), "offset already taken");
         assert_ne!(pid, hit.part);

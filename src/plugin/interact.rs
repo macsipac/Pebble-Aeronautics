@@ -209,6 +209,108 @@ fn look_dir(e: &Entity) -> [f32; 3] {
     [(-yaw.sin() * pitch.cos()) as f32, (-pitch.sin()) as f32, (yaw.cos() * pitch.cos()) as f32]
 }
 
+
+// --- block orientation -------------------------------------------------------
+
+/// Everything that decides how a placed block is oriented, in the target's own (unturned) frame: the
+/// player's look direction, the face that was clicked, and how high on that face the click landed (0..1).
+pub(super) struct Orient { pub(super) look: [f32; 3], pub(super) normal: [i32; 3], pub(super) frac_y: f32 }
+
+/// A world-space vector in the frame of a body / cart that is turned by `q`.
+pub(super) fn to_local(q: [f32; 4], v: [f32; 3]) -> [f32; 3] { rotate([-q[0], -q[1], -q[2], q[3]], v) }
+
+/// The axis direction `v` points along most (like vanilla's "nearest looking direction").
+fn axis_dir(v: [f32; 3], horizontal_only: bool) -> [i32; 3] {
+    // Ties (a look exactly diagonal to the frame, which is the normal case on a 45 degree curve) go to the z axis
+    // (the cart's length), then x, then y, so the result does not flip with float noise.
+    let (mut best, mut bv) = (2usize, -1.0f32);
+    for i in [2usize, 0, 1] {
+        if horizontal_only && i == 1 { continue; }
+        if v[i].abs() > bv + 1e-3 { bv = v[i].abs(); best = i; }
+    }
+    let mut d = [0i32; 3];
+    d[best] = if v[best] >= 0.0 { 1 } else { -1 };
+    d
+}
+fn neg(d: [i32; 3]) -> [i32; 3] { [-d[0], -d[1], -d[2]] }
+fn dir_name(d: [i32; 3]) -> &'static str {
+    match d { [1, 0, 0] => "east", [-1, 0, 0] => "west", [0, 1, 0] => "up", [0, -1, 0] => "down", [0, 0, 1] => "south", _ => "north" }
+}
+/// Blocks whose `facing` may also point up / down.
+const VERTICAL_FACING: [&str; 10] = ["observer", "piston", "sticky_piston", "dispenser", "dropper", "barrel", "command_block", "chain_command_block", "repeating_command_block", "end_rod"];
+
+/// The state a block should have when placed like a player would: facing the player, logs along the clicked
+/// axis, slabs / stairs / trapdoors top or bottom, signs and banners turned to the player, buttons on the
+/// clicked surface. Properties the block does not have are ignored; anything not handled keeps its default.
+pub(super) fn oriented_state(default: u16, o: &Orient) -> u16 {
+    let Some(base) = world::get_block_state_by_id(default) else { return default };
+    if base.properties.is_empty() { return default; }
+    let has = |k: &str| base.properties.iter().any(|(pk, _)| pk == k);
+    let name = norm(&base.block_name).to_string();
+    let n = name.as_str();
+    let mut want: Vec<(&str, String)> = Vec::new();
+    let h = axis_dir(o.look, true);
+    // Bottom half: clicked on top of something, or on the lower half of a side (vanilla's rule for slabs / stairs).
+    let bottom = o.normal[1] != -1 && (o.normal[1] == 1 || o.frac_y <= 0.5);
+
+    if has("face") && has("facing") {
+        // Buttons, levers, grindstones: stuck to whatever was clicked.
+        if o.normal[1] != 0 {
+            want.push(("face", if o.normal[1] > 0 { "floor" } else { "ceiling" }.to_string()));
+            want.push(("facing", dir_name(h).to_string()));
+        } else {
+            want.push(("face", "wall".to_string()));
+            want.push(("facing", dir_name(o.normal).to_string()));
+        }
+    } else if n.ends_with("trapdoor") && has("facing") {
+        if o.normal[1] == 0 {
+            want.push(("facing", dir_name(o.normal).to_string()));
+            want.push(("half", if o.frac_y > 0.5 { "top" } else { "bottom" }.to_string()));
+        } else {
+            want.push(("facing", dir_name(neg(h)).to_string()));
+            want.push(("half", if o.normal[1] == 1 { "bottom" } else { "top" }.to_string()));
+        }
+    } else if has("facing") {
+        let d = if n.ends_with("stairs") || n.ends_with("fence_gate") || n.ends_with("door") { h }
+            else if n.ends_with("anvil") { [-h[2], 0, h[0]] }
+            else if n == "hopper" { let d = neg(o.normal); if d == [0, 1, 0] { [0, -1, 0] } else { d } }
+            else if VERTICAL_FACING.contains(&n) { neg(axis_dir(o.look, false)) }
+            else { neg(h) };
+        want.push(("facing", dir_name(d).to_string()));
+    }
+    if has("axis") {
+        let i = (0..3).find(|i| o.normal[*i] != 0).unwrap_or(1);
+        want.push(("axis", ["x", "y", "z"][i].to_string()));
+    }
+    if has("half") && n.ends_with("stairs") { want.push(("half", if bottom { "bottom" } else { "top" }.to_string())); }
+    if has("type") && n.ends_with("_slab") { want.push(("type", if bottom { "bottom" } else { "top" }.to_string())); }
+    if has("rotation") {
+        let yaw = (-o.look[0]).atan2(o.look[2]).to_degrees();
+        let r = (((180.0 + yaw) * 16.0 / 360.0) + 0.5).floor() as i32 & 15;
+        want.push(("rotation", r.to_string()));
+    }
+    if want.is_empty() { return default; }
+
+    // The states of one block are consecutive ids, so search outwards from the default one.
+    let target: Vec<(String, String)> = base.properties.iter()
+        .map(|(k, v)| (k.clone(), want.iter().rev().find(|w| w.0 == k.as_str()).map_or_else(|| v.clone(), |w| w.1.clone())))
+        .collect();
+    if target == base.properties { return default; }
+    let mut alive = [true, true];
+    for step in 1..=4096i32 {
+        for (i, sgn) in [1i32, -1].into_iter().enumerate() {
+            if !alive[i] { continue; }
+            let Ok(id) = u16::try_from(i32::from(default) + sgn * step) else { alive[i] = false; continue };
+            match world::get_block_state_by_id(id) {
+                Some(s) if s.block_id == base.block_id => { if s.properties == target { return id; } }
+                _ => alive[i] = false,
+            }
+        }
+        if !alive[0] && !alive[1] { break; }
+    }
+    default
+}
+
 /// Attacks are *not* handled through entity events: modern clients send punches in their own packet.
 /// Punching is detected from the arm swing instead (see [`AnimHandler`]).
 ///
@@ -216,53 +318,63 @@ fn look_dir(e: &Entity) -> [f32; 3] {
 /// cubes). Clicks on it arrive as [`EntityHandler`] events and name the exact block; the ray-cast in
 /// [`UseHandler`] is the fallback.
 
-/// True when `id` is the anchor entity whose id one of our client-only shulkers borrows.
+/// True when `id` is the made-up entity id of one of our client-only shulkers.
 fn is_collider(id: i32) -> bool {
     STATE.with(|s| s.borrow().bodies.values().any(|v| {
         v.parts.try_borrow().is_ok_and(|ps| ps.iter().any(|p| p.col.as_ref().is_some_and(|c| c.eid == id)))
     }))
 }
 
-/// Our client-only shulkers use the entity id of a real anchor, so Pumpkin finds the target of a punch
-/// and doesn't kick for "attacking an invalid entity". Punches themselves are counted from the arm
-/// swing; a right-click on the shulker is treated as a click on the block.
+/// Handles a click on one of our client-only shulkers / interaction entities (body or cart). Returns true
+/// when `id` was one of them (or one that just went away) and the click must be cancelled.
+/// Our shulkers use made-up entity ids, so Pumpkin reports clicks on them as "unknown entity" events;
+/// cancelling those is what keeps the player from being kicked. Punches themselves are counted from the
+/// arm swing; a right-click on the shulker is treated as a click on the block.
+fn handle_collider_click(player: &pumpkin_plugin_api::Player, id: i32, action: &EntityInteractionAction) -> bool {
+    if is_collider(id) {
+        if !matches!(action, EntityInteractionAction::Attack) {
+            // The click names the exact shulker (= block), so open it directly.
+            let opened = !is_sneaking(player) && try_open_by_collider(player, id, now_tick());
+            if !opened { use_block(player); }
+        }
+        true
+    } else if is_cart_collider(id) {
+        if !matches!(action, EntityInteractionAction::Attack) {
+            // The click names the exact shulker (= block) that was hit: open that block directly instead of
+            // re-casting a ray on the server, which can miss at block edges and then silently does nothing.
+            let now = now_tick();
+            let opened = !is_sneaking(player) && cart_part_by_collider(id)
+                .is_some_and(|(cart, cell)| cart_try_open(player, &CartHit { cart, cell, normal: [0, 0, 0], is_cart: false, frac_y: 0.5 }, now));
+            if !opened { cart_use(player, None); }
+        }
+        true
+    } else {
+        // Late click on a shulker whose block just went away: swallow it, don't act on what's behind.
+        RECENT_DEAD.with(|r| r.borrow().contains(&id))
+    }
+}
+
+/// Clicks on a collider normally arrive here only if some real entity has the id; ours don't (see
+/// [`UnknownEntityHandler`]), but this stays as a harmless guard plus the cart-block placement below.
 pub(super) struct EntityHandler;
 impl EventHandler<PlayerInteractEntityEvent> for EntityHandler {
     fn handle(&self, _server: Server, mut ev: PlayerInteractEntityEventData) -> PlayerInteractEntityEventData {
-        if is_collider(ev.entity_id) {
+        if handle_collider_click(&ev.player, ev.entity_id, &ev.action) {
             ev.cancelled = true;
-            if !matches!(ev.action, EntityInteractionAction::Attack) {
-                // Same as for carts: the click names the exact shulker (= block), so open it directly.
-                let opened = !is_sneaking(&ev.player) && try_open_by_collider(&ev.player, ev.entity_id, now_tick());
-                if !opened { use_block(&ev.player); }
-            }
-        } else if is_cart_collider(ev.entity_id) {
-            ev.cancelled = true;
-            if !matches!(ev.action, EntityInteractionAction::Attack) {
-                // The click names the exact shulker (= block) that was hit: open that block directly instead of
-                // re-casting a ray on the server, which can miss at block edges and then silently does nothing.
-                let now = now_tick();
-                let opened = !is_sneaking(&ev.player) && cart_part_by_collider(ev.entity_id)
-                    .is_some_and(|(cart, cell)| cart_try_open(&ev.player, &CartHit { cart, cell, normal: [0, 0, 0], is_cart: false }, now));
-                if !opened { cart_use(&ev.player, None); }
-            }
         } else if !matches!(ev.action, EntityInteractionAction::Attack) && cart_entity_click(&ev.player, ev.entity_id) {
             // A block in hand on a minecart: place it instead of sitting down.
-            ev.cancelled = true;
-        } else if RECENT_DEAD.with(|r| r.borrow().contains(&ev.entity_id)) {
-            // Late click on a shulker whose block just went away: swallow it, don't act on what's behind.
             ev.cancelled = true;
         }
         ev
     }
 }
 
-/// Safety net: a click on a shulker whose anchor was removed a moment ago would get the player kicked
-/// for an unknown entity; swallow it instead.
+/// The client-side shulkers have made-up entity ids, so a click on one reaches Pumpkin as a click on an
+/// unknown entity (which would kick the player). Answer it here instead and cancel.
 pub(super) struct UnknownEntityHandler;
 impl EventHandler<PlayerInteractUnknownEntityEvent> for UnknownEntityHandler {
     fn handle(&self, _server: Server, mut ev: PlayerInteractUnknownEntityEventData) -> PlayerInteractUnknownEntityEventData {
-        if RECENT_DEAD.with(|r| r.borrow().contains(&ev.entity_id)) {
+        if handle_collider_click(&ev.player, ev.entity_id, &ev.action) {
             ev.cancelled = true;
         }
         ev
@@ -915,6 +1027,16 @@ fn place_part(world: &World, wname: &str, _clicked_body: BodyId, player: &pumpki
     let off = [base[0] + hit.normal_local[0], base[1] + hit.normal_local[1], base[2] + hit.normal_local[2]];
     if total_parts() + 1 > MAX_PARTS { return; }
 
+    // Orient the block (facing, axis, slab half, ...) in the body's own frame, so it looks right however the body is turned.
+    let Some((bpos, brot, _)) = STATE.with(|s| s.borrow_mut().engines.get_mut(wname).and_then(|eng| eng.body_state(hit.body))) else { return };
+    let w = [ex + f64::from(dir[0] * hit.toi) - bpos[0], ey + f64::from(dir[1] * hit.toi) - bpos[1], ez + f64::from(dir[2] * hit.toi) - bpos[2]];
+    let hl = to_local(brot, [w[0] as f32, w[1] as f32, w[2] as f32]);
+    let state = oriented_state(state, &Orient {
+        look: to_local(brot, dir),
+        normal: hit.normal_local,
+        frac_y: (hl[1] - base[1] as f32 + 0.5).clamp(0.0, 1.0),
+    });
+
     let mut view = View::new(world);
     let part = STATE.with(|s| {
         let mut st = s.borrow_mut();
@@ -972,14 +1094,22 @@ fn place_part(world: &World, wname: &str, _clicked_body: BodyId, player: &pumpki
 // layers >= 1 (they may overhang the cart sideways), never beside or under the cart.
 //
 // Rotation: Pumpkin does not keep a minecart's yaw up to date, so the heading is derived from the cart's
-// own movement and snapped to quarter turns (so the collision shulkers stay exact). With `CART_FOLD` the
-// house only turns when the cart changes *axis* (a curve), not when it simply reverses.
+// own movement and followed smoothly at any angle (a line of blocks stays a line on a 45 degree curve). With
+// `CART_FOLD` reversing along the same line does not spin the house around. The client-side collision
+// shulkers can only be axis-aligned boxes: they follow the turned positions, but their shape does not turn.
 
 /// Fold the heading onto its axis: reversing along the same line does not spin the house.
 const CART_FOLD: bool = true;
 /// Key of the saved block list on the minecart entity (under `TAG_NS`), and of its saved quarter turn.
 const CART_KEY: &str = "cart";
 const CART_QUARTER_KEY: &str = "cartk";
+/// Saved heading in hundredths of a degree (replaces the old quarter turn).
+const CART_YAW_KEY: &str = "cartyaw";
+/// A heading sample is taken after this much travel (blocks, squared); each sample moves the yaw this far (0..1) to it.
+const CART_SAMPLE_DIST_SQ: f64 = 0.0036;
+const CART_TURN_GAIN: f32 = 0.3;
+/// The visuals are only turned again after the yaw changed by more than this (radians).
+const CART_YAW_EPS: f32 = 0.004;
 /// Marks the saved block list (per block: offset, state, block-entity NBT, chest contents).
 const CART_MAGIC: &[u8] = b"PMC2";
 /// Height of a minecart's hitbox, and how far the grid origin sits above the entity's feet so that
@@ -1006,8 +1136,12 @@ pub(super) struct Cart {
     /// Where the visuals were last placed / where the cart was last seen.
     last: StdCell<[f64; 3]>,
     pos: StdCell<[f64; 3]>,
-    /// Quarter turns of the blocks (0..=3) and the matching rotation.
-    quarter: StdCell<u8>,
+    /// Smoothed heading (radians about Y, 0 = +z), the heading the visuals were last turned to, and the matching rotation.
+    yaw: StdCell<f32>,
+    applied: StdCell<f32>,
+    saved_yaw: StdCell<f32>,
+    /// Where the last heading sample was taken (x, z).
+    href: StdCell<[f64; 2]>,
     rot: StdCell<[f32; 4]>,
     strikes: StdCell<u8>,
 }
@@ -1019,17 +1153,35 @@ thread_local! {
 
 fn cart_origin(p: [f64; 3]) -> [f64; 3] { [p[0], p[1] + CART_ORIGIN_Y, p[2]] }
 
-/// Rotation about the vertical axis for `k` quarter turns (Minecraft yaw `k * 90`).
-fn quarter_rot(k: u8) -> [f32; 4] {
-    const H: f32 = std::f32::consts::FRAC_1_SQRT_2;
-    match k & 3 { 0 => [0.0, 0.0, 0.0, 1.0], 1 => [0.0, -H, 0.0, H], 2 => [0.0, -1.0, 0.0, 0.0], _ => [0.0, H, 0.0, H] }
+/// Rotation about the vertical axis by `yaw` radians (Minecraft yaw 0 = +z; positive turns +z towards +x).
+fn yaw_rot(yaw: f32) -> [f32; 4] { let h = yaw * 0.5; [0.0, h.sin(), 0.0, h.cos()] }
+
+fn wrap_pi(a: f32) -> f32 {
+    let t = std::f32::consts::TAU;
+    let r = (a + std::f32::consts::PI).rem_euclid(t) - std::f32::consts::PI;
+    if r <= -std::f32::consts::PI { r + t } else { r }
 }
 
-/// The quarter turn that matches the rail under a cart: 1 on an east-west rail, else 0.
-fn rail_quarter(world: &World, pos: [f64; 3]) -> u8 {
+/// The heading of the rail under a cart (the line the cart runs along; curves run diagonally), or `None` when
+/// the cart is not on a rail. A rail is a line, so the result is only meaningful modulo a half turn.
+fn rail_heading(world: &World, pos: [f64; 3]) -> Option<f32> {
+    use std::f32::consts::{FRAC_PI_2, FRAC_PI_4};
     let st = world.get_block_state(BlockPos { x: pos[0].floor() as i32, y: (pos[1] + 0.1).floor() as i32, z: pos[2].floor() as i32 });
-    if norm(&st.block_name).ends_with("rail") && st.properties.iter().any(|(k, v)| k == "shape" && v.ends_with("east_west")) { 1 } else { 0 }
+    if !norm(&st.block_name).ends_with("rail") { return None; }
+    let (_, shape) = st.properties.iter().find(|(k, _)| k == "shape")?;
+    Some(match shape.as_str() {
+        "east_west" | "ascending_east" | "ascending_west" => -FRAC_PI_2,
+        "south_east" | "north_west" => -FRAC_PI_4,
+        "north_east" | "south_west" => FRAC_PI_4,
+        _ => 0.0,
+    })
 }
+
+/// Heading for a freshly registered cart: the rail's, else straight along +z.
+fn rail_yaw(world: &World, pos: [f64; 3]) -> f32 { rail_heading(world, pos).unwrap_or(0.0) }
+
+/// How fast the heading turns towards the rail's heading (0..1 per tick).
+const CART_RAIL_GAIN: f32 = 0.3;
 
 // --- saved formats ---------------------------------------------------------
 
@@ -1147,16 +1299,17 @@ fn register_cart(world: &World, ent: Entity, blocks: &[CartBlock]) -> Option<Rc<
     if let Some(c) = STATE.with(|s| s.borrow().carts.get(&id).cloned()) { return Some(c); }
     let p = ent.get_position();
     let pos = [p.0, p.1, p.2];
-    // A saved cart keeps its turn; a new one starts aligned with the rail it sits on.
-    let saved = ent.get_int(TAG_NS, CART_QUARTER_KEY).map(|v| (v & 3) as u8);
-    let k = saved.unwrap_or_else(|| if CART_FOLD { rail_quarter(world, pos) } else { 0 });
-    if saved.is_none() { ent.set_int(TAG_NS, CART_QUARTER_KEY, i32::from(k)); }
-    let rot = quarter_rot(k);
+    // A saved cart keeps its heading (older saves only have a quarter turn); a new one starts aligned with the rail it sits on.
+    let saved = ent.get_int(TAG_NS, CART_YAW_KEY).map(|v| (v as f32 / 100.0).to_radians())
+        .or_else(|| ent.get_int(TAG_NS, CART_QUARTER_KEY).map(|v| -((v & 3) as f32) * std::f32::consts::FRAC_PI_2));
+    let yaw = wrap_pi(saved.unwrap_or_else(|| rail_yaw(world, pos)));
+    if saved.is_none() { ent.set_int(TAG_NS, CART_YAW_KEY, (yaw.to_degrees() * 100.0).round() as i32); }
+    let rot = yaw_rot(yaw);
     let parts = build_parts(world, pos, rot, blocks, 0);
     let cart = Rc::new(Cart {
         id, world: world.get_name(), ent, next: StdCell::new(blocks.len() as u32),
         vis: Rc::new(BodyVis::new(parts, rot)), last: StdCell::new(pos), pos: StdCell::new(pos),
-        quarter: StdCell::new(k), rot: StdCell::new(rot), strikes: StdCell::new(0),
+        yaw: StdCell::new(yaw), applied: StdCell::new(yaw), saved_yaw: StdCell::new(yaw), href: StdCell::new([p.0, p.2]), rot: StdCell::new(rot), strikes: StdCell::new(0),
     });
     STATE.with(|s| { s.borrow_mut().carts.insert(id, cart.clone()); });
     save_cart(&cart);
@@ -1290,22 +1443,45 @@ pub(super) fn cart_tick(server: &Server) {
         let p = [pp.0, pp.1, pp.2];
         c.pos.set(p);
 
-        // Heading from movement: the dominant axis decides (with some hysteresis for diagonals).
-        let (dx, dz) = (p[0] - prev[0], p[2] - prev[2]);
-        let mut k = c.quarter.get();
-        if dx * dx + dz * dz > 4e-4 {
-            let heading = if dx.abs() > dz.abs() * 1.3 { if dx > 0.0 { 3 } else { 1 } }
-                else if dz.abs() > dx.abs() * 1.3 { if dz > 0.0 { 0 } else { 2 } }
-                else { k };
-            // Folded: only a change of axis (a curve) turns the blocks, and then to face the new direction of
-            // travel (a right turn turns them right, a left turn left); reversing along the line keeps them.
-            k = if CART_FOLD { if (heading & 1) != (k & 1) { heading } else { k } } else { heading };
+        // Heading. On a rail the rail itself is the authority: the cart's heading is turned (every tick, moving or
+        // not) towards the rail's line, so a cart that stopped half-way round a curve settles on the curve's true
+        // angle instead of staying at whatever angle the movement samples happened to leave it at. Off rails the
+        // heading is derived from the movement: sampled after a bit of travel (so standing still or wobbling never
+        // turns the blocks) and followed smoothly. Either way it is folded: a line has two directions, so take the
+        // one nearest to the current heading and reversing does not spin the blocks.
+        let _ = prev;
+        let mut yaw = c.yaw.get();
+        if let Some(target) = rail_heading(&world, p) {
+            let mut diff = wrap_pi(target - yaw);
+            if CART_FOLD {
+                if diff > std::f32::consts::FRAC_PI_2 { diff -= std::f32::consts::PI; }
+                else if diff < -std::f32::consts::FRAC_PI_2 { diff += std::f32::consts::PI; }
+            }
+            yaw = if diff.abs() < 0.01 { wrap_pi(yaw + diff) } else { wrap_pi(yaw + diff * CART_RAIL_GAIN) };
+            c.yaw.set(yaw);
+            c.href.set([p[0], p[2]]);
+        } else {
+            let r = c.href.get();
+            let (dx, dz) = (p[0] - r[0], p[2] - r[1]);
+            if dx * dx + dz * dz > CART_SAMPLE_DIST_SQ {
+                let mut diff = wrap_pi(dx.atan2(dz) as f32 - yaw);
+                if CART_FOLD {
+                    if diff > std::f32::consts::FRAC_PI_2 { diff -= std::f32::consts::PI; }
+                    else if diff < -std::f32::consts::FRAC_PI_2 { diff += std::f32::consts::PI; }
+                }
+                yaw = wrap_pi(yaw + diff * CART_TURN_GAIN);
+                c.yaw.set(yaw);
+                c.href.set([p[0], p[2]]);
+            }
         }
-        let turned = k != c.quarter.get();
+        let turned = wrap_pi(yaw - c.applied.get()).abs() > CART_YAW_EPS;
         if turned {
-            c.quarter.set(k);
-            c.rot.set(quarter_rot(k));
-            c.ent.set_int(TAG_NS, CART_QUARTER_KEY, i32::from(k));
+            c.applied.set(yaw);
+            c.rot.set(yaw_rot(yaw));
+            if wrap_pi(yaw - c.saved_yaw.get()).abs() > 0.017 {
+                c.saved_yaw.set(yaw);
+                c.ent.set_int(TAG_NS, CART_YAW_KEY, (yaw.to_degrees() * 100.0).round() as i32);
+            }
         }
 
         let lp = c.last.get();
@@ -1389,7 +1565,7 @@ fn ray_box(eye: [f64; 3], dir: [f32; 3], lo: [f64; 3], hi: [f64; 3]) -> Option<(
 }
 
 /// `cell` and `normal` are in the cart's own (unturned) grid; `is_cart` means the cart itself was hit.
-struct CartHit { cart: Rc<Cart>, cell: [i32; 3], normal: [i32; 3], is_cart: bool }
+struct CartHit { cart: Rc<Cart>, cell: [i32; 3], normal: [i32; 3], is_cart: bool, frac_y: f32 }
 
 /// Nearest cart (or block on a cart) under the crosshair, unless a real block is in front of it.
 fn cart_hit(player: &pumpkin_plugin_api::Player, reach: f32) -> Option<CartHit> {
@@ -1405,22 +1581,26 @@ fn cart_hit(player: &pumpkin_plugin_api::Player, reach: f32) -> Option<CartHit> 
         let p = c.pos.get();
         if dist_sq((p[0], p[1], p[2]), eye) > (f64::from(reach) + 24.0).powi(2) { continue; }
         let (o, rot) = (cart_origin(p), c.rot.get());
-        let mut cands: Vec<([f64; 3], [f64; 3], [i32; 3], bool)> = vec![([p[0] - 0.49, p[1], p[2] - 0.49], [p[0] + 0.49, p[1] + CART_H, p[2] + 0.49], [0, 0, 0], true)];
-        if let Ok(parts) = c.vis.parts.try_borrow() {
-            for pt in parts.iter() {
-                let m = part_center(o, rot, pt.offset);
-                // A hair larger than the block: the client picks entities with some slack and the cart may have moved a tick.
-                cands.push(([m.0 - 0.52, m.1 - 0.52, m.2 - 0.52], [m.0 + 0.52, m.1 + 0.52, m.2 + 0.52], pt.offset, false));
+        // The cart itself is not turned: plain box in world space.
+        if let Some((t, n)) = ray_box(eye3, dir, [p[0] - 0.49, p[1], p[2] - 0.49], [p[0] + 0.49, p[1] + CART_H, p[2] + 0.49]) {
+            if n != [0, 0, 0] && t <= f64::from(reach) && !best.as_ref().is_some_and(|b| b.0 <= t) {
+                best = Some((t, CartHit { cart: c.clone(), cell: [0, 0, 0], normal: [0, 1, 0], is_cart: true, frac_y: 0.5 }));
             }
         }
-        let conj = [-rot[0], -rot[1], -rot[2], rot[3]];
-        for (lo, hi, cell, is_cart) in cands {
-            let Some((t, n)) = ray_box(eye3, dir, lo, hi) else { continue };
-            if n == [0, 0, 0] || t > f64::from(reach) || best.as_ref().is_some_and(|b| b.0 <= t) { continue; }
-            // The face normal is in world space; the grid is in the cart's turned frame.
-            let l = rotate(conj, [n[0] as f32, n[1] as f32, n[2] as f32]);
-            let normal = [l[0].round() as i32, l[1].round() as i32, l[2].round() as i32];
-            best = Some((t, CartHit { cart: c.clone(), cell, normal, is_cart }));
+        // The blocks are turned by any angle: cast the ray in the cart's own frame, where every block is an
+        // axis-aligned cube, so picking is exact at 45 degrees too and the normal comes out in grid terms.
+        let rel = to_local(rot, [(eye3[0] - o[0]) as f32, (eye3[1] - o[1]) as f32, (eye3[2] - o[2]) as f32]);
+        let eye_l = [f64::from(rel[0]), f64::from(rel[1]), f64::from(rel[2])];
+        let dir_l = to_local(rot, dir);
+        if let Ok(parts) = c.vis.parts.try_borrow() {
+            for pt in parts.iter() {
+                let m = [f64::from(pt.offset[0]), f64::from(pt.offset[1]), f64::from(pt.offset[2])];
+                // A hair larger than the block: the client picks entities with some slack and the cart may have moved a tick.
+                let Some((t, n)) = ray_box(eye_l, dir_l, [m[0] - 0.52, m[1] - 0.52, m[2] - 0.52], [m[0] + 0.52, m[1] + 0.52, m[2] + 0.52]) else { continue };
+                if n == [0, 0, 0] || t > f64::from(reach) || best.as_ref().is_some_and(|b| b.0 <= t) { continue; }
+                let hy = eye_l[1] + f64::from(dir_l[1]) * t;
+                best = Some((t, CartHit { cart: c.clone(), cell: pt.offset, normal: n, is_cart: false, frac_y: ((hy - m[1]) as f32 + 0.5).clamp(0.0, 1.0) }));
+            }
         }
     }
     let (t, hit) = best?;
@@ -1433,9 +1613,10 @@ fn held_block(player: &pumpkin_plugin_api::Player) -> Option<(ItemStack, u16)> {
     Some((stack, state))
 }
 
-fn place_on_cart(player: &pumpkin_plugin_api::Player, cart: &Rc<Cart>, target: [i32; 3]) {
+fn place_on_cart(player: &pumpkin_plugin_api::Player, cart: &Rc<Cart>, target: [i32; 3], normal: [i32; 3], frac_y: f32) {
     if target[1] < 1 { return; }
     let Some((stack, state)) = held_block(player) else { return };
+    let state = oriented_state(state, &Orient { look: to_local(cart.rot.get(), look_dir(&player.as_entity())), normal, frac_y });
     {
         let Ok(parts) = cart.vis.parts.try_borrow() else { return };
         if parts.len() >= MAX_PARTS || parts.iter().any(|p| p.offset == target) { return; }
@@ -1492,16 +1673,16 @@ fn cart_use(player: &pumpkin_plugin_api::Player, via: Option<Entity>) -> bool {
     // Holding the button repeats the click; place one block per few ticks.
     if STATE.with(|s| s.borrow().last_action.get(&pid).is_some_and(|t| now.saturating_sub(*t) < 3)) { return true; }
     STATE.with(|s| { s.borrow_mut().last_action.insert(pid, now); });
-    let (cart, target) = match hit {
-        Some(h) if h.is_cart => (h.cart, [0, 1, 0]),
-        Some(h) => (h.cart, [h.cell[0] + h.normal[0], h.cell[1] + h.normal[1], h.cell[2] + h.normal[2]]),
+    let (cart, target, normal, frac_y) = match hit {
+        Some(h) if h.is_cart => (h.cart, [0, 1, 0], [0, 1, 0], 0.5),
+        Some(h) => (h.cart, [h.cell[0] + h.normal[0], h.cell[1] + h.normal[1], h.cell[2] + h.normal[2]], h.normal, h.frac_y),
         None => {
             let Some(ent) = via else { return false };
             let Some(c) = register_cart(&player.get_world(), ent, &[]) else { return false };
-            (c, [0, 1, 0])
+            (c, [0, 1, 0], [0, 1, 0], 0.5)
         }
     };
-    place_on_cart(player, &cart, target);
+    place_on_cart(player, &cart, target, normal, frac_y);
     true
 }
 
@@ -1666,5 +1847,198 @@ fn break_cart_block(player: &pumpkin_plugin_api::Player, cart: &Rc<Cart>, cell: 
     if let Some(n) = &name {
         player.get_world().play_custom_sound(block_sounds(n).1, SoundCategory::Blocks, at, 1.0, 0.8);
         if hand_over { give(player, n, nbt.as_deref(), &saved_inv); }
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// felling trees
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// Broken logs waiting to be turned into a falling tree: (world name, log position).
+    static TREE_FALLS: RefCell<Vec<(String, Cell)>> = const { RefCell::new(Vec::new()) };
+}
+
+fn is_log_name(n: &str) -> bool { n.ends_with("_log") && !n.starts_with("stripped_") }
+
+fn block_name_at(world: &World, c: Cell) -> String {
+    let st = world.get_block_state(BlockPos { x: c[0], y: c[1], z: c[2] });
+    if st.is_air { return String::new(); }
+    world::block_state_to_info(st.id).map(|i| norm(&i.name).to_string()).unwrap_or_default()
+}
+
+/// Cheap check that a log cluster is a natural tree and not a log cabin: enough leaves of the same
+/// species touch it, it stands on the ground, and nothing man-made touches it.
+/// Returns the connected logs and the species' leaf block name.
+fn is_tree(world: &World, start: Cell, log_name: &str) -> Option<(Vec<Cell>, String)> {
+    let leaf_name = format!("{}_leaves", log_name.strip_suffix("_log")?);
+    let mut logs: Vec<Cell> = Vec::new();
+    let mut seen: HashSet<Cell> = HashSet::from([start]);
+    let mut queue = VecDeque::from([start]);
+    let mut leaves: HashSet<Cell> = HashSet::new();
+    while let Some(c) = queue.pop_front() {
+        logs.push(c);
+        if logs.len() > cfg().tree_max_logs { return None; } // a forest-sized blob, not a tree
+        for dx in -1..=1 { for dy in -1..=1 { for dz in -1..=1 {
+            if dx == 0 && dy == 0 && dz == 0 { continue; }
+            let n = [c[0] + dx, c[1] + dy, c[2] + dz];
+            let face = dx.abs() + dy.abs() + dz.abs() == 1;
+            let nm = block_name_at(world, n);
+            if nm == leaf_name { leaves.insert(n); continue; }
+            if face && ["planks", "stairs", "slab", "door", "glass", "brick", "fence", "wall", "sign", "ladder", "torch", "chest", "table", "bed", "carpet", "wool", "concrete", "stone"]
+                .iter().any(|k| nm.contains(k)) { return None; }
+            if nm == log_name && seen.insert(n) { queue.push_back(n); }
+        } } }
+    }
+    // The trunk must stand on natural ground, not on a built floor.
+    let lowest = *logs.iter().min_by_key(|c| c[1])?;
+    let below = block_name_at(world, [lowest[0], lowest[1] - 1, lowest[2]]);
+    let grounded = ["dirt", "grass_block", "podzol", "mycelium", "mud", "moss_block", "sand", "snow"].iter().any(|k| below.contains(k));
+    let c = cfg();
+    if (c.tree_require_ground && !grounded) || logs.len() < c.tree_min_logs || leaves.len() < c.tree_min_leaves { return None; }
+    Some((logs, leaf_name))
+}
+
+/// Breaking a log of a tree is cancelled and queued; `process_tree_falls` then turns it into physics blocks.
+pub(super) struct TreeBreakHandler;
+impl EventHandler<BlockBreakEvent> for TreeBreakHandler {
+    fn handle(&self, _server: Server, mut ev: BlockBreakEventData) -> BlockBreakEventData {
+        if ev.cancelled || !cfg().trees_enabled { return ev; }
+        let Some(player) = &ev.player else { return ev };
+        let name = norm(&ev.block).to_string();
+        if !is_log_name(&name) { return ev; }
+        let world = player.get_world();
+        let pos = [ev.block_pos.x, ev.block_pos.y, ev.block_pos.z];
+        // Touches only the world and `TREE_FALLS`, never `STATE` (events can arrive mid host call).
+        if is_tree(&world, pos, &name).is_none() { return ev; }
+        let wname = world.get_name();
+        TREE_FALLS.with(|t| {
+            let mut t = t.borrow_mut();
+            if t.len() < 16 && !t.iter().any(|(w, c)| *w == wname && *c == pos) { t.push((wname, pos)); }
+        });
+        ev.cancelled = true;
+        ev
+    }
+}
+
+/// Turns the queued trees into physics bodies: the broken log and everything of the tree above it
+/// (connected logs and nearby leaves) becomes one body that gets a sideways shove at the top.
+pub(super) fn process_tree_falls(server: &Server) {
+    let falls = TREE_FALLS.with(|t| std::mem::take(&mut *t.borrow_mut()));
+    for (wname, start) in falls {
+        let Some(world) = server.get_world_by_name(&wname) else { continue };
+        let log_name = block_name_at(&world, start);
+        if !is_log_name(&log_name) { continue; } // already gone
+        let Some((logs, leaf_name)) = is_tree(&world, start, &log_name) else { continue };
+        let log_set: HashSet<Cell> = logs.iter().copied().filter(|c| c[1] >= start[1]).collect();
+        let state_at = |c: Cell| world.get_block_state_id(BlockPos { x: c[0], y: c[1], z: c[2] });
+
+        let budget = cfg().tree_max_blocks.min(MAX_PARTS.saturating_sub(total_parts()));
+        if budget < 4 { continue; }
+        const DIRS: [[i32; 3]; 6] = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+        // Face-connected from the broken log through the logs above it; leaves touching them are collected on the way.
+        let mut order: Vec<(Cell, u16)> = Vec::new();
+        let mut seen: HashSet<Cell> = HashSet::from([start]);
+        let mut queue = VecDeque::from([start]);
+        let mut leaf_q: VecDeque<(Cell, u32)> = VecDeque::new();
+        while let Some(c) = queue.pop_front() {
+            if order.len() >= budget { break; }
+            order.push((c, state_at(c)));
+            for d in DIRS {
+                let n = [c[0] + d[0], c[1] + d[1], c[2] + d[2]];
+                if seen.contains(&n) { continue; }
+                if log_set.contains(&n) { seen.insert(n); queue.push_back(n); }
+                else if block_name_at(&world, n) == leaf_name { seen.insert(n); leaf_q.push_back((n, 1)); }
+            }
+        }
+        // Then leaves, nearest first, until the budget is used up.
+        while let Some((c, depth)) = leaf_q.pop_front() {
+            if order.len() >= budget { break; }
+            order.push((c, state_at(c)));
+            if depth >= cfg().tree_leaf_reach { continue; }
+            for d in DIRS {
+                let n = [c[0] + d[0], c[1] + d[1], c[2] + d[2]];
+                if !seen.contains(&n) && block_name_at(&world, n) == leaf_name { seen.insert(n); leaf_q.push_back((n, depth + 1)); }
+            }
+        }
+        if order.len() < 2 { continue; }
+
+        let nbts: Vec<Option<Vec<u8>>> = order.iter().map(|_| None).collect();
+        let Ok(bid) = spawn_body_rotated(&world, &order, start, None, None, &nbts) else { continue };
+        let flags = BlockFlags::NOTIFY_LISTENERS | BlockFlags::NOTIFY_NEIGHBORS | BlockFlags::SKIP_DROPS | BlockFlags::SKIP_BLOCK_ENTITY_REPLACED_CALLBACK;
+        for (c, _) in &order {
+            world.set_block_by_name(BlockPos { x: c[0], y: c[1], z: c[2] }, "minecraft:air", flags);
+        }
+
+        // Topple: push the highest log sideways in a random horizontal direction. The push grows with the
+        // tree's mass, so heavy trees fall over as reliably as small ones.
+        let top = order.iter().map(|(c, _)| *c).filter(|c| log_set.contains(c)).max_by_key(|c| c[1]).unwrap_or(start);
+        let off = [top[0] - start[0], top[1] - start[1], top[2] - start[2]];
+        let ang = rand01() * std::f32::consts::TAU;
+        let (dx, dz) = (ang.cos(), ang.sin());
+        STATE.with(|s| {
+            if let Some(eng) = s.borrow_mut().engines.get_mut(&wname) {
+                if let Some((pos, rot, _)) = eng.body_state(bid) {
+                    let tonnes = eng.mass(bid).unwrap_or(1000.0) / 1000.0;
+                    let c = cfg();
+                    let speed = (c.tree_push_base + c.tree_push_per_tonne * tonnes).min(c.tree_push_max);
+                    let p = part_center(pos, rot, off);
+                    let target = [p.0 + f64::from(dx * speed), p.1, p.2 + f64::from(dz * speed)];
+                    let local = [off[0] as f32, off[1] as f32, off[2] as f32];
+                    eng.drag(bid, local, target, GRAB_GAIN, speed, 1.0);
+                }
+            }
+        });
+    }
+}
+
+/// Leaf blocks (ghost parts) of physics bodies: each disappears with a small chance per second, and when it
+/// ends up inside a block. Runs every `leaf_check_interval_ticks`.
+pub(super) fn process_leaf_decay(server: &Server) {
+    let c = cfg();
+    if !c.leaves_ghost { return; }
+    let now = STATE.with(|s| s.borrow().ticks);
+    if now % c.leaf_check_interval_ticks != 0 { return; }
+    let dt = c.leaf_check_interval_ticks as f32 / 20.0;
+    let p_decay = 1.0 - (1.0 - c.leaf_decay_chance_per_second).powf(dt);
+
+    // (world, body, part, centre, visuals) of every leaf part.
+    let leaves: Vec<(String, BodyId, u32, (f64, f64, f64), Rc<BodyVis>)> = STATE.with(|s| {
+        let st = s.borrow();
+        let mut out = Vec::new();
+        for ((wname, bid), vis) in &st.bodies {
+            let Some(eng) = st.engines.get(wname) else { continue };
+            let Some((pos, rot, _)) = eng.body_state(*bid) else { continue };
+            let Ok(ps) = vis.parts.try_borrow() else { continue };
+            for p in ps.iter().filter(|p| is_leaves_state(p.state)) {
+                out.push((wname.clone(), *bid, p.id, part_center(pos, rot, p.offset), vis.clone()));
+            }
+        }
+        out
+    });
+    if leaves.is_empty() { return; }
+
+    let mut loc: HashMap<(BodyId, u32), (BodyId, Rc<BodyVis>)> = HashMap::new();
+    for (_, bid, pid, _, vis) in &leaves { loc.insert((*bid, *pid), (*bid, vis.clone())); }
+    for (wname, bid, pid, centre, _) in leaves {
+        let mut gone = rand01() < p_decay;
+        if !gone && c.leaf_vanish_inside_blocks {
+            if let Some(world) = server.get_world_by_name(&wname) {
+                let st = world.get_block_state(BlockPos { x: centre.0.floor() as i32, y: centre.1.floor() as i32, z: centre.2.floor() as i32 });
+                gone = !st.is_air && !st.is_liquid && world::get_block_state_by_id(st.id).is_some_and(|s| !s.outline_shapes.is_empty());
+            }
+        }
+        if !gone { continue; }
+        let Some((cur_body, cur_vis)) = loc.get(&(bid, pid)).cloned() else { continue };
+        let Some(splits) = remove_and_split(&wname, cur_body, pid, &cur_vis) else { continue };
+        for (new_body, ids) in splits {
+            let Some(nv) = STATE.with(|s| s.borrow().bodies.get(&(wname.clone(), new_body)).cloned()) else { continue };
+            for id in ids {
+                for ((ob, opid), v) in loc.iter_mut() {
+                    if *ob == bid && *opid == id { *v = (new_body, nv.clone()); }
+                }
+            }
+        }
     }
 }

@@ -1,4 +1,4 @@
-//! Visuals: block-display entities per part, and client-side collision shulkers.
+//! Visuals: block-display entities per part, and client-side collision shulkers (riding the displays).
 use super::*;
 
 // ---------------------------------------------------------------------------
@@ -50,15 +50,27 @@ impl BodyVis {
 // ---------------------------------------------------------------------------
 
 /// Collision for one full-cube part: a shulker that exists only on clients (never in the world, so it
-/// can't wander off, take damage or show up in the world data). It is announced to clients under the
-/// entity id of the part's *anchor*, an invisible, empty block display at the block's bottom that does
-/// exist on the server. That has three effects: the server's own position updates for the anchor move
-/// the shulker on the client (so no per-tick packets of ours), Pumpkin finds a real entity when a
-/// client punches the shulker (no "invalid entity" kick), and nothing extra has to be spawned.
+/// can't wander off, take damage or show up in the world data). It gets a made-up entity id (see
+/// `next_fake_id`) and is announced to each nearby client with one spawn, one metadata and one
+/// "set passengers" packet that makes it *ride the part's block display*. From then on the client
+/// itself keeps the shulker glued to the display every tick, so we send no movement packets for it at
+/// all, and since a rider is positioned by its vehicle it is not snapped to the block grid.
+/// The display sits at the block's bottom centre (its transform is shifted up to compensate), because a
+/// rider's feet end up exactly at the vehicle's position.
+/// Clicks on the shulker name the fake id; Pumpkin reports them as "unknown entity" events (see
+/// `UnknownEntityHandler`), which we answer ourselves.
 pub(super) struct Collider {
+    /// Real (server-side, invisible, static) entity whose id the client-side shulker borrows, so Pumpkin
+    /// finds a real entity when a client punches it (a made-up id gets the player kicked for attacking an invalid entity).
     pub(super) anchor: Entity,
-    /// The anchor's entity id, which the client-side shulker borrows.
+    /// Invisible real display at the block's bottom centre that the shulker rides (a rider's feet sit at its vehicle's position).
+    pub(super) mount: Entity,
+    /// The anchor's entity id.
     pub(super) eid: i32,
+    /// Where the anchor was last teleported to (it is only moved when the part got far from it).
+    pub(super) anchor_at: StdCell<(f64, f64, f64)>,
+    /// Entity id of the block display the shulker rides.
+    pub(super) vehicle: i32,
     /// Where the shulker's feet should be at spawn time.
     pub(super) target: StdCell<(f64, f64, f64)>,
     /// Players that currently have it spawned: (player entity id, tick sent).
@@ -122,17 +134,21 @@ fn spawn_packets(c: &Collider, at: (f64, f64, f64)) -> [ClientboundPacket; 2] {
         ClientboundPacket::CSetEntityMetadata(CSetEntityMetadata { entity_id: c.eid, metadata }),
     ]
 }
+/// Makes the client-side shulker ride its block display (replaces the display's passenger list, which is
+/// empty on the server anyway). Ignored by a client that doesn't know the display (yet).
+fn ride_packet(c: &Collider) -> ClientboundPacket {
+    ClientboundPacket::CSetPassengers(CSetPassengers { entity_id: c.vehicle, passengers: vec![c.eid] })
+}
 fn remove_packet(c: &Collider) -> ClientboundPacket {
     ClientboundPacket::CRemoveEntities(CRemoveEntities { entity_ids: vec![c.eid] })
 }
 
 /// The collider proximity pass runs every this many ticks (spawn/despawn of client-side shulkers does
-/// not need tick precision; the shulkers themselves are moved by the server's anchor teleports).
+/// not need tick precision; the shulkers themselves ride the block displays, so they need no movement packets).
 const COLLIDER_SYNC_EVERY: u64 = 2;
-/// A brand-new anchor must be fully announced to the client (spawn + its display metadata) before our
-/// shulker packets take over its entity id. If the server's own packets for the anchor arrive *after* the
-/// shulker spawn, the client applies display metadata to a shulker and drops with a network protocol error
-/// (timing-dependent, so it only happens sometimes). Waiting a few ticks makes the order deterministic.
+/// The block display must already exist on the client when the ride packet arrives (a rider whose vehicle is
+/// unknown is simply left standing where it spawned). Waiting a few ticks after the display was created makes
+/// that order deterministic.
 const COLLIDER_SETTLE_TICKS: u64 = 6;
 
 /// Keeps every nearby Java player's client in sync with the collision shulkers.
@@ -215,16 +231,19 @@ pub(super) fn sync_colliders(server: &Server) {
                 let near = pw == wname && dist_sq(*eye, tgt) < view2;
                 let idx = viewers.iter().position(|v| v.0 == *pid);
                 match (near, idx) {
-                    // Too fresh: the server hasn't finished announcing the anchor itself yet.
+                    // Too fresh: the server hasn't finished announcing the display yet.
                     (true, None) if now.saturating_sub(c.born) < COLLIDER_SETTLE_TICKS => {}
                     (true, None) => {
                         for pk in spawn_packets(c, tgt) { jp.send_packet(&pk); }
+                        jp.send_packet(&ride_packet(c));
                         viewers.push((*pid, now));
                     }
-                    // The server's own spawn of the anchor can reach the client after ours and replace the
-                    // shulker there; announce it again a few times (windows, as we only run every 2nd tick).
+                    // The server's own spawn of the display can still reach the client after our ride packet (the
+                    // ride is then ignored); repeat just that one packet a few times (windows, as we only run
+                    // every 2nd tick). Nothing is re-spawned and nothing moves per tick.
                     (true, Some(i)) if matches!(now.saturating_sub(viewers[i].1), 3..=4 | 10..=11 | 40..=41) => {
                         for pk in spawn_packets(c, tgt) { jp.send_packet(&pk); }
+                        jp.send_packet(&ride_packet(c));
                     }
                     (false, Some(i)) => {
                         jp.send_packet(&remove_packet(c));
@@ -274,13 +293,17 @@ pub(super) fn part_center(pos: [f64; 3], rot: [f32; 4], offset: [i32; 3]) -> (f6
 
 pub(super) fn place_part_entities(p: &PartVis, pos: [f64; 3], rot: [f32; 4], with_rotation: bool) {
     let c = part_center(pos, rot, p.offset);
-    // The display sits at the block's centre.
+    // The display sits at the block's centre. The shulker rides an invisible mount at the block's bottom,
+    // which is the only thing moved for the collision (the client moves the shulker itself).
+    let feet = (c.0, c.1 - 0.5, c.2);
     p.display.teleport(c, p.display.get_world());
-    // The anchor (and with it the shulker, whose feet are at its origin) sits at the block's bottom.
     if let Some(col) = &p.col {
-        let feet = (c.0, c.1 - 0.5, c.2);
-        col.anchor.teleport(feet, col.anchor.get_world());
+        col.mount.teleport(feet, col.mount.get_world());
         col.target.set(feet);
+        // The shulker rides the display, so the anchor only has to stay roughly where the block is (the server
+        // checks punch reach against it): move it only after the part got 1.5+ blocks away.
+        let a = col.anchor_at.get();
+        if dist_sq(a, feet) > 2.25 { col.anchor.teleport(feet, col.anchor.get_world()); col.anchor_at.set(feet); }
     }
     if with_rotation {
         set_rotation(p, rot);
@@ -291,6 +314,7 @@ pub(super) fn spawn_part(world: &World, state: u16, offset: [i32; 3], id: u32, c
     // Chest-like blocks keep their contents only in `inv` (saved / given as the `container` component). Block
     // entity NBT with its own `Items` would go stale as soon as the contents change and duplicate items.
     let nbt = if world::block_state_to_info(state).is_some_and(|i| matches!(interaction(&i.name), Some(Interaction::Storage(..)))) { None } else { nbt };
+    let feet = (center.0, center.1 - 0.5, center.2);
     let display = world.spawn_entity(EntityType::BlockDisplay, center);
     let bd = display.as_block_display().ok_or("Could not create a block display")?;
     bd.set_block_state_id(state);
@@ -305,7 +329,6 @@ pub(super) fn spawn_part(world: &World, state: u16, offset: [i32; 3], id: u32, c
     OWN_IDS.with(|o| { o.borrow_mut().insert(did); });
 
     // Collision (full-cube blocks only; a shulker is a full cube, slabs/stairs would feel wrong): see `Collider`.
-    let feet = (center.0, center.1 - 0.5, center.2);
     // Blocks without a shulker get an Interaction entity sized to their outline instead.
     let shape = if solid { None } else {
         world::get_block_state_by_id(state).and_then(|s| {
@@ -322,13 +345,27 @@ pub(super) fn spawn_part(world: &World, state: u16, offset: [i32; 3], id: u32, c
     };
     let col = (solid || shape.is_some()).then(|| {
         let a = world.spawn_entity(EntityType::BlockDisplay, feet);
-        if let Some(abd) = a.as_block_display() { abd.get_display().set_teleport_duration(2); }
         a.set_has_gravity(false);
         tag(&a);
         OWN_IDS.with(|o| { o.borrow_mut().insert(a.get_id()); });
-        Rc::new(Collider { eid: a.get_id() as i32, anchor: a, target: StdCell::new(feet), viewers: RefCell::new(Vec::new()), born: STATE.with(|s| s.try_borrow().map_or(0, |st| st.ticks)), shape })
+        let m = world.spawn_entity(EntityType::BlockDisplay, feet);
+        if let Some(mb) = m.as_block_display() { mb.get_display().set_teleport_duration(2); }
+        m.set_has_gravity(false);
+        tag(&m);
+        OWN_IDS.with(|o| { o.borrow_mut().insert(m.get_id()); });
+        Rc::new(Collider { eid: a.get_id() as i32, anchor: a, anchor_at: StdCell::new(feet), vehicle: m.get_id() as i32, mount: m, target: StdCell::new(feet), viewers: RefCell::new(Vec::new()), born: STATE.with(|s| s.try_borrow().map_or(0, |st| st.ticks)), shape })
     });
     Ok(PartVis { id, did, offset, state, display, bd, col, nbt, inv: RefCell::new(Vec::new()), store: RefCell::new(None), strikes: StdCell::new(0) })
+}
+
+pub(super) fn kill_part(p: PartVis) {
+    p.display.remove();
+    OWN_IDS.with(|o| { o.borrow_mut().remove(&p.did); });
+    if let Some(c) = p.col {
+        PENDING_ANCHORS.with(|a| a.borrow_mut().push((c.clone(), now_millis() + ANCHOR_LINGER_MS)));
+        RECENT_DEAD.with(|r| { let mut r = r.borrow_mut(); r.push_back(c.eid); if r.len() > 256 { r.pop_front(); } });
+        GRAVE.with(|g| g.borrow_mut().push(c));
+    }
 }
 
 thread_local! {
@@ -353,16 +390,8 @@ pub(super) fn flush_pending_anchors() {
     });
     for c in due {
         c.anchor.remove();
+        OWN_IDS.with(|o| { o.borrow_mut().remove(&c.mount.get_id()); });
+        c.mount.remove();
         OWN_IDS.with(|o| { o.borrow_mut().remove(&(c.eid as u32)); });
-    }
-}
-
-pub(super) fn kill_part(p: PartVis) {
-    p.display.remove();
-    OWN_IDS.with(|o| { o.borrow_mut().remove(&p.did); });
-    if let Some(c) = p.col {
-        PENDING_ANCHORS.with(|a| a.borrow_mut().push((c.clone(), now_millis() + ANCHOR_LINGER_MS)));
-        RECENT_DEAD.with(|r| { let mut r = r.borrow_mut(); r.push_back(c.eid); if r.len() > 256 { r.pop_front(); } });
-        GRAVE.with(|g| g.borrow_mut().push(c));
     }
 }

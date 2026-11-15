@@ -298,13 +298,13 @@ fn recover(server: &Server) -> bool {
 
     // Entity ids of every helper entity we currently own.
     let mut live: HashSet<u32> = HashSet::new();
-    PENDING_ANCHORS.with(|p| { for (c, _) in p.borrow().iter() { live.insert(c.anchor.get_id()); } });
+    PENDING_ANCHORS.with(|p| { for (c, _) in p.borrow().iter() { live.insert(c.anchor.get_id()); live.insert(c.mount.get_id()); } });
     STATE.with(|s| {
         for vis in s.borrow().bodies.values() {
             if let Ok(parts) = vis.parts.try_borrow() {
                 for p in parts.iter() {
                     live.insert(p.display.get_id());
-                    if let Some(c) = &p.col { live.insert(c.anchor.get_id()); }
+                    if let Some(c) = &p.col { live.insert(c.anchor.get_id()); live.insert(c.mount.get_id()); }
                 }
             }
         }
@@ -312,7 +312,7 @@ fn recover(server: &Server) -> bool {
             if let Ok(parts) = cart.vis.parts.try_borrow() {
                 for p in parts.iter() {
                     live.insert(p.display.get_id());
-                    if let Some(c) = &p.col { live.insert(c.anchor.get_id()); }
+                    if let Some(c) = &p.col { live.insert(c.anchor.get_id()); live.insert(c.mount.get_id()); }
                 }
             }
         }
